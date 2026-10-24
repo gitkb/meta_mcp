@@ -900,15 +900,10 @@ impl McpServer {
             .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
 
         // Find and return the raw config
-        for name in &[".meta", ".meta.yaml", ".meta.yml"] {
-            let path = meta_dir.join(name);
-            if path.exists() {
-                let content = std::fs::read_to_string(&path)?;
-                return Ok(format!("Config file: {}\n\n{}", path.display(), content));
-            }
-        }
-
-        Err(anyhow::anyhow!("No meta config found"))
+        let (path, _) = config::find_meta_config_in(meta_dir)
+            .ok_or_else(|| anyhow::anyhow!("No meta config found"))?;
+        let content = std::fs::read_to_string(&path)?;
+        Ok(format!("Config file: {}\n\n{}", path.display(), content))
     }
 
     fn tool_get_project_path(&self, args: &serde_json::Value) -> Result<String> {
@@ -2287,6 +2282,19 @@ mod tests {
             meta_dir: Some(tmp.path().to_path_buf()),
         };
         (server, tmp)
+    }
+
+    #[test]
+    fn test_get_config_ignores_meta_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".meta/skills")).unwrap();
+        std::fs::write(tmp.path().join(".meta.yaml"), "projects: {}\n").unwrap();
+        let server = McpServer {
+            meta_dir: Some(tmp.path().to_path_buf()),
+        };
+        let result = server.tool_get_config(&serde_json::json!({})).unwrap();
+        assert!(result.contains(".meta.yaml"));
+        assert!(result.contains("projects: {}"));
     }
 
     #[test]
