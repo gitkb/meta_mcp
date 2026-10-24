@@ -27,10 +27,16 @@ const SERVER_VERSION: &str = "0.1.0";
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
     jsonrpc: String,
+    /// `None` only when the member is absent (a notification); `"id": null` is `Some(Null)`.
+    #[serde(default, deserialize_with = "present")]
     id: Option<serde_json::Value>,
     method: String,
     #[serde(default)]
     params: serde_json::Value,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(d).map(Some)
 }
 
 #[derive(Debug, Serialize)]
@@ -146,7 +152,9 @@ impl McpServer {
                 }
             };
 
-            let response = self.handle_request(&request);
+            let Some(response) = self.handle_request(&request) else {
+                continue;
+            };
             let response_json = serde_json::to_string(&response)?;
             writeln!(stdout, "{response_json}")?;
             stdout.flush()?;
@@ -155,19 +163,27 @@ impl McpServer {
         Ok(())
     }
 
-    fn handle_request(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
+    /// Returns `None` for a notification (no `id`): JSON-RPC never answers one,
+    /// and this server acts on none of them.
+    fn handle_request(&self, request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+        let id = request.id.clone()?;
         let result = match request.method.as_str() {
             "initialize" => self.handle_initialize(),
-            "initialized" => return self.ok_response(request.id.clone(), serde_json::Value::Null),
             "tools/list" => self.handle_list_tools(),
             "tools/call" => self.handle_call_tool(&request.params),
-            _ => Err(anyhow::anyhow!("Method not found: {}", request.method)),
+            _ => {
+                return Some(self.error_response(
+                    Some(id),
+                    -32601,
+                    format!("Method not found: {}", request.method),
+                ))
+            }
         };
 
-        match result {
-            Ok(value) => self.ok_response(request.id.clone(), value),
-            Err(e) => self.error_response(request.id.clone(), -32603, e.to_string()),
-        }
+        Some(match result {
+            Ok(value) => self.ok_response(Some(id), value),
+            Err(e) => self.error_response(Some(id), -32603, e.to_string()),
+        })
     }
 
     fn ok_response(
@@ -2295,6 +2311,28 @@ mod tests {
         let result = server.tool_get_config(&serde_json::json!({})).unwrap();
         assert!(result.contains(".meta.yaml"));
         assert!(result.contains("projects: {}"));
+    }
+
+    #[test]
+    fn test_notifications_get_no_reply() {
+        let server = McpServer { meta_dir: None };
+        let request = |line: &str| serde_json::from_str::<JsonRpcRequest>(line).unwrap();
+
+        for line in [
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#,
+            r#"{"jsonrpc":"2.0","method":"no/such/method"}"#,
+        ] {
+            assert!(server.handle_request(&request(line)).is_none(), "{line}");
+        }
+
+        let unknown = server
+            .handle_request(&request(
+                r#"{"jsonrpc":"2.0","id":null,"method":"no/such/method"}"#,
+            ))
+            .unwrap();
+        assert_eq!(unknown.id, Some(serde_json::Value::Null));
+        assert_eq!(unknown.error.unwrap().code, -32601);
     }
 
     #[test]
