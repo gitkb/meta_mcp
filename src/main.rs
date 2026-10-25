@@ -2668,7 +2668,12 @@ mod tests {
         git(dir, &["commit", "-qm", "init"]);
     }
 
-    fn batch(server: &McpServer, args: serde_json::Value) -> Result<serde_json::Value> {
+    /// `meta_batch_execute`; a string `command` is a script, run with
+    /// `sh -c` the way a user asks for a shell.
+    fn batch(server: &McpServer, mut args: serde_json::Value) -> Result<serde_json::Value> {
+        if let Some(script) = args["command"].as_str().map(str::to_string) {
+            args["command"] = json!(["sh", "-c", script]);
+        }
         Ok(serde_json::from_str(&server.tool_batch_execute(&args)?)?)
     }
 
