@@ -350,13 +350,14 @@ impl McpServer {
             },
             Tool {
                 name: "meta_exec".to_string(),
-                description: "Execute a command across all meta projects".to_string(),
+                description: "Execute a command across all meta projects (meta exec)".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "command": {
-                            "type": "string",
-                            "description": "Command to execute"
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "The program and its arguments, one per item, e.g. [\"git\", \"log\", \"--format=%h %s\"]. They run as given, with no shell; for a shell, ask for one: [\"sh\", \"-c\", \"...\"]"
                         },
                         "tag": {
                             "type": "string",
@@ -496,8 +497,9 @@ impl McpServer {
                             "description": "Specific project to add files in (optional, defaults to all)"
                         },
                         "files": {
-                            "type": "string",
-                            "description": "Files to add (default: '.' for all changed files)"
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Paths to add, one per item, passed to git as given (default: [\".\"] for all changed files)"
                         },
                         "tag": {
                             "type": "string",
@@ -798,8 +800,9 @@ impl McpServer {
                     "type": "object",
                     "properties": {
                         "command": {
-                            "type": "string",
-                            "description": "Command to execute in each project"
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "The program and its arguments to run in each project, one per item. They run as given, with no shell; for a shell, ask for one: [\"sh\", \"-c\", \"...\"]"
                         },
                         "tag": {
                             "type": "string",
@@ -971,9 +974,8 @@ impl McpServer {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
 
-        let command = args
-            .get("command")
-            .and_then(|v| v.as_str())
+        let command = string_list(args, "command")?
+            .filter(|argv| !argv.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
 
         let mut cmd = Command::new("meta");
@@ -983,10 +985,7 @@ impl McpServer {
             cmd.arg("--tag").arg(tag);
         }
 
-        // Split command into parts
-        for part in command.split_whitespace() {
-            cmd.arg(part);
-        }
+        cmd.arg("exec").arg("--").args(&command);
 
         cmd.current_dir(meta_dir);
 
@@ -1282,7 +1281,9 @@ impl McpServer {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
 
-        let files = args.get("files").and_then(|v| v.as_str()).unwrap_or(".");
+        let files = string_list(args, "files")?
+            .filter(|files| !files.is_empty())
+            .unwrap_or_else(|| vec![".".to_string()]);
 
         let mut cmd = Command::new("meta");
         cmd.arg("--json");
@@ -1291,7 +1292,7 @@ impl McpServer {
             cmd.arg("--tag").arg(tag);
         }
 
-        cmd.arg("git").arg("add").arg(files);
+        cmd.arg("git").arg("add").arg("--").args(&files);
         cmd.current_dir(meta_dir);
 
         let output = cmd.output().context("Failed to execute meta git add")?;
@@ -1300,7 +1301,7 @@ impl McpServer {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if output.status.success() {
-            Ok(format!("Staged files: {files}\n{stdout}"))
+            Ok(format!("Staged files: {}\n{stdout}", files.join(", ")))
         } else {
             Err(anyhow::anyhow!("git add failed:\n{stdout}\n{stderr}"))
         }
@@ -2207,9 +2208,11 @@ impl McpServer {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
 
-        let command = args
-            .get("command")
-            .and_then(|v| v.as_str())
+        let command = string_list(args, "command")?
+            .filter(|argv| !argv.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
+        let (program, program_args) = command
+            .split_first()
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
 
         let tag_filter = args.get("tag").and_then(|v| v.as_str());
@@ -2282,9 +2285,8 @@ impl McpServer {
                 continue;
             }
 
-            let output = Command::new("sh")
-                .arg("-c")
-                .arg(command)
+            let output = Command::new(program)
+                .args(program_args)
                 .current_dir(&project_path)
                 .output();
 
@@ -2475,6 +2477,17 @@ impl McpServer {
             .ok_or_else(|| anyhow::anyhow!("No meta config found"))?;
         let (projects, _ignore) = config::parse_meta_config(&config_path)?;
         Ok(projects)
+    }
+}
+
+/// A tool argument that is a list of strings, such as a command's argv or a
+/// list of paths; None when it is absent.
+fn string_list(args: &serde_json::Value, key: &str) -> Result<Option<Vec<String>>> {
+    match args.get(key).filter(|value| !value.is_null()) {
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .with_context(|| format!("'{key}' must be a list of strings")),
+        None => Ok(None),
     }
 }
 
