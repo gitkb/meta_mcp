@@ -9,7 +9,7 @@ use meta_cli::git_utils;
 use meta_cli::query::{Query, RepoState, WorkspaceState};
 use meta_core::config::{self, ProjectInfo};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -19,6 +19,10 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// Server information
 const SERVER_NAME: &str = "meta-mcp";
 const SERVER_VERSION: &str = "0.1.0";
+
+/// The longest request line read; a longer one gets an error reply instead of
+/// filling memory.
+const MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
 
 // ============================================================================
 // MCP Protocol Types
@@ -47,6 +51,19 @@ struct JsonRpcResponse {
     result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<JsonRpcError>,
+}
+
+/// What one input line gets back: a response, or an array for a batch.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum Reply {
+    One(JsonRpcResponse),
+    Batch(Vec<JsonRpcResponse>),
+}
+
+/// JSON-RPC 2.0 ids are strings, numbers or null.
+fn valid_id(id: &serde_json::Value) -> bool {
+    id.is_null() || id.is_string() || id.is_number()
 }
 
 #[derive(Debug, Serialize)]
@@ -128,39 +145,110 @@ impl McpServer {
         let meta_dir = std::env::current_dir()
             .ok()
             .and_then(|dir| config::find_meta_config(&dir, None))
-            .map(|(config_path, _)| config_path.parent().unwrap().to_path_buf());
+            .and_then(|(config_path, _)| config_path.parent().map(|dir| dir.to_path_buf()));
 
         Self { meta_dir }
     }
 
-    fn run(&mut self) -> Result<()> {
-        let stdin = std::io::stdin();
-        let mut stdout = std::io::stdout();
-        let reader = BufReader::new(stdin.lock());
+    fn run(&self) -> Result<()> {
+        self.serve(std::io::stdin().lock(), std::io::stdout().lock())
+    }
 
-        for line in reader.lines() {
-            let line = line?;
-            if line.is_empty() {
-                continue;
+    /// Answers each newline-delimited JSON-RPC message from `input`. Bad input
+    /// gets an error reply and serving goes on; it stops at end of input or
+    /// when `output` fails.
+    fn serve(&self, mut input: impl BufRead, mut output: impl Write) -> Result<()> {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if (&mut input)
+                .take(MAX_LINE_BYTES + 1)
+                .read_until(b'\n', &mut line)?
+                == 0
+            {
+                return Ok(());
             }
-
-            let request: JsonRpcRequest = match serde_json::from_str(&line) {
-                Ok(req) => req,
-                Err(e) => {
-                    eprintln!("Failed to parse request: {e}");
-                    continue;
-                }
+            let reply = if line.len() as u64 > MAX_LINE_BYTES && !line.ends_with(b"\n") {
+                input.skip_until(b'\n')?;
+                Some(Reply::One(
+                    self.parse_error("Request too large".to_string()),
+                ))
+            } else {
+                self.handle_line(&line)
             };
-
-            let Some(response) = self.handle_request(&request) else {
-                continue;
-            };
-            let response_json = serde_json::to_string(&response)?;
-            writeln!(stdout, "{response_json}")?;
-            stdout.flush()?;
+            if let Some(reply) = reply {
+                serde_json::to_writer(&mut output, &reply)?;
+                output.write_all(b"\n")?;
+                output.flush()?;
+            }
         }
+    }
 
-        Ok(())
+    /// Replies to one line: a request, a notification (no reply) or a batch.
+    fn handle_line(&self, line: &[u8]) -> Option<Reply> {
+        let Ok(text) = std::str::from_utf8(line) else {
+            return Some(Reply::One(
+                self.parse_error("Request is not valid UTF-8".to_string()),
+            ));
+        };
+        if text.trim().is_empty() {
+            return None;
+        }
+        let message = match serde_json::from_str(text) {
+            Ok(message) => message,
+            Err(e) => return Some(Reply::One(self.parse_error(e.to_string()))),
+        };
+        match message {
+            serde_json::Value::Array(batch) if batch.is_empty() => {
+                Some(Reply::One(self.error_response(
+                    Some(serde_json::Value::Null),
+                    -32600,
+                    "Invalid Request: empty batch".to_string(),
+                )))
+            }
+            serde_json::Value::Array(batch) => {
+                let replies: Vec<_> = batch
+                    .into_iter()
+                    .filter_map(|message| self.handle_message(message))
+                    .collect();
+                (!replies.is_empty()).then_some(Reply::Batch(replies))
+            }
+            message => self.handle_message(message).map(Reply::One),
+        }
+    }
+
+    /// Replies to one JSON-RPC message, or `None` for a valid notification.
+    fn handle_message(&self, message: serde_json::Value) -> Option<JsonRpcResponse> {
+        let id = message.get("id").filter(|id| valid_id(id)).cloned();
+        let invalid = |reason: String| {
+            Some(self.error_response(
+                Some(id.clone().unwrap_or(serde_json::Value::Null)),
+                -32600,
+                format!("Invalid Request: {reason}"),
+            ))
+        };
+        let request: JsonRpcRequest = match serde_json::from_value(message) {
+            Ok(request) => request,
+            Err(e) => return invalid(e.to_string()),
+        };
+        if request.jsonrpc != "2.0" {
+            return invalid("jsonrpc must be \"2.0\"".to_string());
+        }
+        if !request.id.as_ref().is_none_or(valid_id) {
+            return invalid("id must be a string, number or null".to_string());
+        }
+        if !(request.params.is_null() || request.params.is_object() || request.params.is_array()) {
+            return invalid("params must be an object or array".to_string());
+        }
+        self.handle_request(&request)
+    }
+
+    fn parse_error(&self, message: String) -> JsonRpcResponse {
+        self.error_response(
+            Some(serde_json::Value::Null),
+            -32700,
+            format!("Parse error: {message}"),
+        )
     }
 
     /// Returns `None` for a notification (no `id`): JSON-RPC never answers one,
@@ -688,7 +776,7 @@ impl McpServer {
                         },
                         "force": {
                             "type": "boolean",
-                            "description": "Force restore even if there are uncommitted changes (default: false)"
+                            "description": "Restore projects with uncommitted changes too, saving tracked changes in a git stash first; the result gives each stash's commit id (default: false)"
                         }
                     },
                     "required": ["name"]
@@ -696,7 +784,7 @@ impl McpServer {
             },
             Tool {
                 name: "meta_batch_execute".to_string(),
-                description: "Execute a command across projects with optional atomic rollback on failure".to_string(),
+                description: "Execute a command across projects, optionally rolling back the projects it ran in if it fails".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -710,7 +798,7 @@ impl McpServer {
                         },
                         "atomic": {
                             "type": "boolean",
-                            "description": "If true, automatically rollback all projects if any fail (default: false)"
+                            "description": "If true, refuse to start unless every target project is a clean git repository; on the first failure, stop and reset each project the command ran in to its branch and commit from before, discarding its changes to tracked files. Untracked files it created are left in place and listed. Projects it never reached are not touched (default: false)"
                         }
                     },
                     "required": ["command"]
@@ -1941,8 +2029,8 @@ impl McpServer {
                 continue;
             }
 
-            let branch =
-                git_utils::current_branch(&project_path).unwrap_or_else(|| "unknown".to_string());
+            // `None` (null) for a detached HEAD.
+            let branch = git_utils::current_branch(&project_path);
             let commit = self
                 .git_output(&project_path, &["rev-parse", "HEAD"])
                 .unwrap_or_else(|_| "unknown".to_string());
@@ -2053,10 +2141,7 @@ impl McpServer {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             let proj_path = project.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let branch = project
-                .get("branch")
-                .and_then(|v| v.as_str())
-                .unwrap_or("main");
+            let branch = project.get("branch").and_then(|v| v.as_str());
             let commit = project.get("commit").and_then(|v| v.as_str()).unwrap_or("");
 
             let full_path = meta_dir.join(proj_path);
@@ -2078,30 +2163,33 @@ impl McpServer {
                 continue;
             }
 
-            // Stash if dirty and force
-            if is_dirty && force {
-                let _ =
-                    self.git_command(&full_path, &["stash", "push", "-m", "meta-restore-backup"]);
-            }
+            // Keep tracked changes in a stash before the reset discards them.
+            let stash = if is_dirty {
+                match self.stash(&full_path, "meta-restore-backup") {
+                    Ok(stash) => stash,
+                    Err(e) => {
+                        failed.push(serde_json::json!({
+                            "project": proj_name,
+                            "error": format!("Failed to stash uncommitted changes, left untouched: {e}")
+                        }));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
 
-            // Checkout branch and reset
-            if let Err(e) = self.git_command(&full_path, &["checkout", branch]) {
-                failed.push(serde_json::json!({
+            match self.restore_repo(&full_path, branch, commit) {
+                Ok(()) => restored.push(serde_json::json!({
                     "project": proj_name,
-                    "error": format!("Failed to checkout: {}", e)
-                }));
-                continue;
-            }
-
-            if let Err(e) = self.git_command(&full_path, &["reset", "--hard", commit]) {
-                failed.push(serde_json::json!({
+                    "stash": stash
+                })),
+                Err(e) => failed.push(serde_json::json!({
                     "project": proj_name,
-                    "error": format!("Failed to reset: {}", e)
-                }));
-                continue;
+                    "error": format!("Failed to restore: {e}"),
+                    "stash": stash
+                })),
             }
-
-            restored.push(proj_name.to_string());
         }
 
         Ok(serde_json::to_string_pretty(&serde_json::json!({
@@ -2142,18 +2230,35 @@ impl McpServer {
             projects.iter().collect()
         };
 
-        // Create pre-execution snapshot if atomic
-        let snapshot_name = if atomic {
-            let name = format!("atomic-batch-{}", chrono::Utc::now().timestamp());
-            let snapshot_args = serde_json::json!({
-                "name": name,
-                "description": "Automatic snapshot before atomic batch execution"
-            });
-            let _ = self.tool_snapshot_create(&snapshot_args);
-            Some(name)
-        } else {
-            None
-        };
+        // Atomic: every target must be a clean git repository before anything
+        // runs, so a rollback discards only what the command changed.
+        let mut before = Vec::new();
+        if atomic {
+            let mut refused = Vec::new();
+            for project in &filtered {
+                let path = meta_dir.join(&project.path);
+                let commit = self.git_output(&path, &["rev-parse", "--verify", "HEAD"]);
+                match (commit, git_utils::is_dirty(&path)) {
+                    (Ok(commit), Some(false)) => {
+                        before.push((git_utils::current_branch(&path), commit))
+                    }
+                    (Ok(_), Some(true)) => refused.push(format!(
+                        "{}: has uncommitted changes or untracked files",
+                        project.name
+                    )),
+                    _ => refused.push(format!(
+                        "{}: not a git repository with a commit",
+                        project.name
+                    )),
+                }
+            }
+            if !refused.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Atomic batch refused, nothing was run: {}",
+                    refused.join("; ")
+                ));
+            }
+        }
 
         let mut results = Vec::new();
         let mut has_failure = false;
@@ -2205,25 +2310,67 @@ impl McpServer {
             }
         }
 
-        // Rollback if atomic and failure
-        let mut rollback_result = None;
-        if atomic && has_failure {
-            if let Some(ref snapshot_name) = snapshot_name {
-                let restore_args = serde_json::json!({
-                    "name": snapshot_name,
-                    "force": true
-                });
-                rollback_result = Some(self.tool_snapshot_restore(&restore_args)?);
+        // Roll back only the projects the command ran in: the first
+        // `results.len()` targets. The ones it never reached are untouched.
+        let rollback = (atomic && has_failure).then(|| {
+            let mut restored = Vec::new();
+            let mut failed = Vec::new();
+            for (project, (branch, commit)) in filtered.iter().zip(&before).take(results.len()) {
+                let path = meta_dir.join(&project.path);
+                match self.restore_repo(&path, branch.as_deref(), commit) {
+                    Ok(()) => restored.push(serde_json::json!({
+                        "project": project.name,
+                        "untracked_files_left": self
+                            .git_output(&path, &["ls-files", "--others", "--exclude-standard"])
+                            .map(|files| files.lines().map(str::to_string).collect::<Vec<_>>())
+                            .unwrap_or_default()
+                    })),
+                    Err(e) => failed.push(serde_json::json!({
+                        "project": project.name,
+                        "error": e.to_string()
+                    })),
+                }
             }
-        }
+            serde_json::json!({
+                "status": if failed.is_empty() { "success" } else { "failed" },
+                "restored": restored,
+                "failed": failed
+            })
+        });
 
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "command": command,
             "results": results,
             "has_failure": has_failure,
-            "rolled_back": rollback_result.is_some(),
-            "rollback_result": rollback_result
+            "rollback": rollback
         }))?)
+    }
+
+    /// Saves the tracked changes in `path` as a stash entry without touching
+    /// the working tree, and returns its commit id (`None` if there are none).
+    fn stash(&self, path: &std::path::Path, message: &str) -> Result<Option<String>> {
+        let commit = self.git_output(path, &["stash", "create", message])?;
+        if commit.is_empty() {
+            return Ok(None);
+        }
+        self.git_command(path, &["stash", "store", "-m", message, &commit])?;
+        Ok(Some(commit))
+    }
+
+    /// Puts the repository at `path` back on `branch` (detached when `None`)
+    /// at `commit`, discarding changes to tracked files. Untracked files stay.
+    fn restore_repo(
+        &self,
+        path: &std::path::Path,
+        branch: Option<&str>,
+        commit: &str,
+    ) -> Result<()> {
+        self.git_command(path, &["reset", "--quiet", "--hard"])?;
+        self.git_command(
+            path,
+            &["checkout", "--quiet", branch.unwrap_or(commit), "--"],
+        )?;
+        self.git_command(path, &["reset", "--quiet", "--hard", commit])
     }
 
     fn git_output(&self, path: &std::path::Path, args: &[&str]) -> Result<String> {
@@ -2282,13 +2429,13 @@ impl McpServer {
 }
 
 fn main() -> Result<()> {
-    let mut server = McpServer::new();
-    server.run()
+    McpServer::new().run()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// Create a server with a known meta_dir for tests that need one.
     fn server_with_meta_dir() -> (McpServer, tempfile::TempDir) {
@@ -2333,6 +2480,211 @@ mod tests {
             .unwrap();
         assert_eq!(unknown.id, Some(serde_json::Value::Null));
         assert_eq!(unknown.error.unwrap().code, -32601);
+    }
+
+    /// Feeds `input` to the server and returns each reply line as JSON.
+    fn serve(input: &[u8]) -> Vec<serde_json::Value> {
+        let server = McpServer { meta_dir: None };
+        let mut output = Vec::new();
+        server.serve(input, &mut output).unwrap();
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn error_code(reply: &serde_json::Value) -> i64 {
+        reply["error"]["code"].as_i64().unwrap()
+    }
+
+    #[test]
+    fn test_bad_input_gets_an_error_reply_and_serving_goes_on() {
+        let initialize = br#"{"jsonrpc":"2.0","id":99,"method":"initialize","params":{}}"#;
+        let too_large = vec![b' '; MAX_LINE_BYTES as usize + 1];
+        for (line, code, id) in [
+            (
+                &br#"{"jsonrpc":"2.0","id":7,"method":"tools/list""#[..],
+                -32700,
+                json!(null),
+            ),
+            (b"\xff\xfe", -32700, json!(null)),
+            (&too_large, -32700, json!(null)),
+            (b"[]", -32600, json!(null)),
+            (b"42", -32600, json!(null)),
+            (br#"{"jsonrpc":"2.0","id":8}"#, -32600, json!(8)),
+            (
+                br#"{"jsonrpc":"1.0","id":"x","method":"tools/list"}"#,
+                -32600,
+                json!("x"),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":{},"method":"tools/list"}"#,
+                -32600,
+                json!(null),
+            ),
+            (
+                br#"{"jsonrpc":"2.0","id":9,"method":"initialize","params":3}"#,
+                -32600,
+                json!(9),
+            ),
+            (br#"{"jsonrpc":"2.0","method":7}"#, -32600, json!(null)),
+            (
+                br#"{"jsonrpc":"2.0","id":10,"method":"no/such/method"}"#,
+                -32601,
+                json!(10),
+            ),
+        ] {
+            let input = [line, b"\n", initialize, b"\n"].concat();
+            let replies = serve(&input);
+            let shown = String::from_utf8_lossy(&line[..line.len().min(80)]);
+            assert_eq!(replies.len(), 2, "{shown}");
+            assert_eq!(error_code(&replies[0]), code, "{shown}");
+            assert_eq!(replies[0]["id"], id, "{shown}");
+            assert_eq!(replies[1]["id"], 99, "{shown}");
+            assert!(replies[1]["result"].is_object(), "{shown}");
+        }
+    }
+
+    #[test]
+    fn test_batch_gets_an_array_of_replies() {
+        let replies = serve(
+            br#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","method":"notifications/initialized"},1]
+[{"jsonrpc":"2.0","method":"notifications/initialized"}]
+"#,
+        );
+        assert_eq!(replies.len(), 1, "an all-notification batch gets no reply");
+        let batch = replies[0].as_array().unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0]["id"], 1);
+        assert!(batch[0]["result"]["tools"].is_array());
+        assert_eq!(error_code(&batch[1]), -32600);
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// A meta workspace with projects `a` (tag `x`) and `b`, each a git repo
+    /// with one commit of `README`.
+    fn workspace() -> (McpServer, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".meta"),
+            r#"{"projects":{"a":{"repo":"x","tags":["x"]},"b":"x"}}"#,
+        )
+        .unwrap();
+        for name in ["a", "b"] {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            git(&dir, &["init", "-q", "-b", "main"]);
+            std::fs::write(dir.join("README"), name).unwrap();
+            git(&dir, &["add", "README"]);
+            git(&dir, &["commit", "-qm", "init"]);
+        }
+        let server = McpServer {
+            meta_dir: Some(tmp.path().to_path_buf()),
+        };
+        (server, tmp)
+    }
+
+    fn batch(server: &McpServer, args: serde_json::Value) -> Result<serde_json::Value> {
+        Ok(serde_json::from_str(&server.tool_batch_execute(&args)?)?)
+    }
+
+    #[test]
+    fn test_atomic_batch_never_touches_projects_it_does_not_target() {
+        let (server, tmp) = workspace();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::write(b.join("README"), "my edit").unwrap();
+        let head = git(&a, &["rev-parse", "HEAD"]);
+
+        let result = batch(
+            &server,
+            json!({
+                "command": "echo changed > README && git -c user.name=t -c user.email=t@example.com commit -qam c && touch new && false",
+                "tag": "x",
+                "atomic": true
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result["rollback"]["status"], "success", "{result}");
+        assert_eq!(
+            result["rollback"]["restored"][0]["untracked_files_left"],
+            json!(["new"])
+        );
+        assert_eq!(git(&a, &["rev-parse", "HEAD"]), head);
+        assert_eq!(std::fs::read_to_string(a.join("README")).unwrap(), "a");
+        assert_eq!(
+            std::fs::read_to_string(b.join("README")).unwrap(),
+            "my edit"
+        );
+        assert_eq!(git(&b, &["stash", "list"]), "");
+    }
+
+    #[test]
+    fn test_atomic_batch_refuses_a_dirty_target_and_runs_nothing() {
+        let (server, tmp) = workspace();
+        std::fs::write(tmp.path().join("b/README"), "my edit").unwrap();
+
+        let err = batch(&server, json!({"command": "touch ran", "atomic": true})).unwrap_err();
+
+        assert!(
+            err.to_string().contains("b: has uncommitted changes"),
+            "{err}"
+        );
+        assert!(!tmp.path().join("a/ran").exists());
+        assert_eq!(git(&tmp.path().join("b"), &["stash", "list"]), "");
+    }
+
+    #[test]
+    fn test_atomic_batch_reports_a_failed_rollback() {
+        let (server, _tmp) = workspace();
+
+        let result = batch(
+            &server,
+            json!({"command": "rm -rf .git && false", "atomic": true}),
+        )
+        .unwrap();
+
+        assert_eq!(result["rollback"]["status"], "failed", "{result}");
+        assert_eq!(result["rollback"]["failed"][0]["project"], "a");
+        assert_eq!(result["rollback"]["restored"], json!([]));
+        assert_eq!(result["results"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_force_restore_keeps_changes_in_a_stash_it_names() {
+        let (server, tmp) = workspace();
+        let a = tmp.path().join("a");
+        server
+            .tool_snapshot_create(&json!({"name": "before"}))
+            .unwrap();
+        std::fs::write(a.join("README"), "my edit").unwrap();
+
+        let result: serde_json::Value = serde_json::from_str(
+            &server
+                .tool_snapshot_restore(&json!({"name": "before", "force": true}))
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(result["status"], "success", "{result}");
+        let stash = result["restored"][0]["stash"].as_str().unwrap();
+        assert_eq!(std::fs::read_to_string(a.join("README")).unwrap(), "a");
+        git(&a, &["stash", "apply", "-q", stash]);
+        assert_eq!(
+            std::fs::read_to_string(a.join("README")).unwrap(),
+            "my edit"
+        );
     }
 
     #[test]
