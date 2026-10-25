@@ -785,7 +785,7 @@ impl McpServer {
                         },
                         "force": {
                             "type": "boolean",
-                            "description": "Restore projects with uncommitted changes too, saving them and untracked files in a git stash first; the result gives each stash's commit id (default: false)"
+                            "description": "Restore projects with uncommitted changes too, saving them and untracked files in a git stash first; the result gives each stash's commit id, and the commit HEAD was on if it moved (default: false)"
                         }
                     },
                     "required": ["name"]
@@ -807,7 +807,7 @@ impl McpServer {
                         },
                         "atomic": {
                             "type": "boolean",
-                            "description": "If true, refuse to start unless every target project is a clean git repository; on the first failure, stop and put each project the command ran in back on its branch and commit from before. What the command changed there, untracked files included, is saved in a git stash named in the result; ignored files are not. Projects it never reached are not touched (default: false)"
+                            "description": "If true, refuse to start unless every target project is the root of a clean git repository; on the first failure, stop and put each project the command reached back on its branch and commit from before. Its uncommitted changes and untracked files there are saved in a git stash, and a commit it left HEAD on is reported, both by id in the result. Ignored files, other refs and effects outside the repositories are not undone. Projects it never reached are not touched (default: false)"
                         }
                     },
                     "required": ["command"]
@@ -2171,9 +2171,10 @@ impl McpServer {
             }
 
             match self.restore_repo(&full_path, branch, commit) {
-                Ok(stash) => restored.push(serde_json::json!({
+                Ok((stash, left)) => restored.push(serde_json::json!({
                     "project": proj_name,
-                    "stash": stash
+                    "stash": stash,
+                    "replaced_head": left
                 })),
                 Err(e) => failed.push(serde_json::json!({
                     "project": proj_name,
@@ -2227,12 +2228,7 @@ impl McpServer {
             let mut refused = Vec::new();
             for project in &filtered {
                 let path = meta_dir.join(&project.path);
-                // `.git` here, so git never acts on an enclosing repository.
-                let commit = if path.join(".git").exists() {
-                    self.git_output(&path, &["rev-parse", "--verify", "HEAD"])
-                } else {
-                    Err(anyhow::anyhow!("no .git"))
-                };
+                let commit = self.repo_git(&path, &["rev-parse", "--verify", "HEAD"]);
                 match (commit, self.is_clean(&path)) {
                     (Ok(commit), Ok(true)) => {
                         before.push((git_utils::current_branch(&path), commit))
@@ -2267,6 +2263,9 @@ impl McpServer {
                     "error": "Path does not exist"
                 }));
                 has_failure = true;
+                if atomic {
+                    break;
+                }
                 continue;
             }
 
@@ -2305,17 +2304,18 @@ impl McpServer {
             }
         }
 
-        // Roll back only the projects the command ran in: the first
-        // `results.len()` targets. The ones it never reached are untouched.
+        // Roll back only the projects the command reached: the first
+        // `results.len()` targets. The ones after them are untouched.
         let rollback = (atomic && has_failure).then(|| {
             let mut restored = Vec::new();
             let mut failed = Vec::new();
             for (project, (branch, commit)) in filtered.iter().zip(&before).take(results.len()) {
                 let path = meta_dir.join(&project.path);
                 match self.restore_repo(&path, branch.as_deref(), commit) {
-                    Ok(stash) => restored.push(serde_json::json!({
+                    Ok((stash, left)) => restored.push(serde_json::json!({
                         "project": project.name,
-                        "stash": stash
+                        "stash": stash,
+                        "replaced_head": left
                     })),
                     Err(e) => failed.push(serde_json::json!({
                         "project": project.name,
@@ -2338,29 +2338,55 @@ impl McpServer {
         }))?)
     }
 
-    /// Whether `path` has no uncommitted changes and no untracked files,
-    /// whatever `status.showUntrackedFiles` says.
+    /// Runs git on the repository whose root is `path` (its `.git` is
+    /// named, so git never falls back to an enclosing repository) and returns
+    /// the trimmed stdout, or an error with git's stderr.
+    fn repo_git(&self, path: &std::path::Path, args: &[&str]) -> Result<String> {
+        let mut git_dir = std::ffi::OsString::from("--git-dir=");
+        git_dir.push(path.join(".git"));
+        let mut work_tree = std::ffi::OsString::from("--work-tree=");
+        work_tree.push(path);
+        let output = Command::new("git")
+            .arg(git_dir)
+            .arg(work_tree)
+            .args(args)
+            .current_dir(path)
+            .output()
+            .with_context(|| format!("Failed to run git {args:?} in {}", path.display()))?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(anyhow::anyhow!(
+                "git {} failed in {}: {}",
+                args.join(" "),
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
+    /// Whether the repository at `path` has no uncommitted changes and no
+    /// untracked files, whatever `status.showUntrackedFiles` says.
     fn is_clean(&self, path: &std::path::Path) -> Result<bool> {
-        let status =
-            self.git_output(path, &["status", "--porcelain", "--untracked-files=normal"])?;
+        let status = self.repo_git(path, &["status", "--porcelain", "--untracked-files=normal"])?;
         Ok(status.is_empty())
     }
 
     /// Puts the repository at `path` back on `branch` (detached when `None`)
-    /// at `commit`. Uncommitted changes and untracked files are first saved
-    /// in a stash entry, whose commit id it returns; ignored files are not.
+    /// at `commit`. Uncommitted changes and untracked files are first saved in
+    /// a stash entry; ignored files are not. Returns that stash's commit id and
+    /// the commit HEAD left behind, when they exist, so both can be recovered.
     fn restore_repo(
         &self,
         path: &std::path::Path,
         branch: Option<&str>,
         commit: &str,
-    ) -> Result<Option<String>> {
-        let stash_head = || {
-            self.git_output(path, &["rev-parse", "--quiet", "--verify", "refs/stash"])
-                .ok()
-        };
-        let old_stash = stash_head();
-        self.git_command(
+    ) -> Result<(Option<String>, Option<String>)> {
+        let head = self.repo_git(path, &["rev-parse", "--verify", "HEAD"])?;
+        // `stash list` is empty, not an error, when there is no stash.
+        let stash_head = || self.repo_git(path, &["stash", "list", "-n1", "--format=%H"]);
+        let old_stash = stash_head()?;
+        self.repo_git(
             path,
             &[
                 "stash",
@@ -2371,17 +2397,20 @@ impl McpServer {
                 "meta-restore-backup",
             ],
         )?;
-        let stash = stash_head().filter(|stash| old_stash.as_ref() != Some(stash));
-        self.git_command(
+        let stash = stash_head()
+            .context("uncommitted changes may be in a new stash entry, see `git stash list`")?;
+        let stash = (stash != old_stash).then_some(stash);
+        let left = (head != commit).then_some(head);
+        self.repo_git(
             path,
             &["checkout", "--quiet", branch.unwrap_or(commit), "--"],
         )
-        .and_then(|()| self.git_command(path, &["reset", "--quiet", "--hard", commit]))
+        .and_then(|_| self.repo_git(path, &["reset", "--quiet", "--hard", commit]))
         .with_context(|| match &stash {
             Some(stash) => format!("uncommitted changes are saved in stash {stash}"),
-            None => "no uncommitted changes".to_string(),
+            None => "there were no uncommitted changes to save".to_string(),
         })?;
-        Ok(stash)
+        Ok((stash, left))
     }
 
     fn git_output(&self, path: &std::path::Path, args: &[&str]) -> Result<String> {
@@ -2395,23 +2424,6 @@ impl McpServer {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         } else {
             Err(anyhow::anyhow!("Git command failed"))
-        }
-    }
-
-    fn git_command(&self, path: &std::path::Path, args: &[&str]) -> Result<()> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .output()
-            .with_context(|| format!("Failed to run git {args:?}"))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "Git command failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
         }
     }
 
@@ -2598,17 +2610,22 @@ mod tests {
         )
         .unwrap();
         for name in ["a", "b"] {
-            let dir = tmp.path().join(name);
-            std::fs::create_dir(&dir).unwrap();
-            git(&dir, &["init", "-q", "-b", "main"]);
-            std::fs::write(dir.join("README"), name).unwrap();
-            git(&dir, &["add", "README"]);
-            git(&dir, &["commit", "-qm", "init"]);
+            init_repo(&tmp.path().join(name));
         }
         let server = McpServer {
             meta_dir: Some(tmp.path().to_path_buf()),
         };
         (server, tmp)
+    }
+
+    /// A git repo at `dir` with one commit of `README`.
+    fn init_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        std::fs::write(dir.join("README"), name).unwrap();
+        git(dir, &["add", "README"]);
+        git(dir, &["commit", "-qm", "init"]);
     }
 
     fn batch(server: &McpServer, args: serde_json::Value) -> Result<serde_json::Value> {
@@ -2635,6 +2652,10 @@ mod tests {
         assert_eq!(result["rollback"]["status"], "success", "{result}");
         let stash = result["rollback"]["restored"][0]["stash"].as_str().unwrap();
         assert_eq!(git(&a, &["show", &format!("{stash}^3:new")]), "");
+        let left = result["rollback"]["restored"][0]["replaced_head"]
+            .as_str()
+            .unwrap();
+        assert_eq!(git(&a, &["show", &format!("{left}:README")]), "changed\n");
         assert!(!a.join("new").exists());
         assert_eq!(git(&a, &["rev-parse", "HEAD"]), head);
         assert_eq!(git(&a, &["branch", "--show-current"]), "main\n");
@@ -2690,7 +2711,10 @@ mod tests {
 
     #[test]
     fn test_atomic_batch_reports_a_failed_rollback() {
-        let (server, _tmp) = workspace();
+        let (server, tmp) = workspace();
+        // The workspace root is a repository too, with work of its own.
+        init_repo(tmp.path());
+        std::fs::write(tmp.path().join("README"), "root edit").unwrap();
 
         let result = batch(
             &server,
@@ -2702,6 +2726,35 @@ mod tests {
         assert_eq!(result["rollback"]["failed"][0]["project"], "a");
         assert_eq!(result["rollback"]["restored"], json!([]));
         assert_eq!(result["results"].as_array().unwrap().len(), 1);
+        assert_eq!(git(tmp.path(), &["stash", "list"]), "");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("README")).unwrap(),
+            "root edit"
+        );
+    }
+
+    #[test]
+    fn test_atomic_batch_stops_at_a_project_that_disappeared() {
+        let (server, tmp) = workspace();
+        init_repo(&tmp.path().join("c"));
+        std::fs::write(
+            tmp.path().join(".meta"),
+            r#"{"projects":{"a":"x","b":"x","c":"x"}}"#,
+        )
+        .unwrap();
+
+        let result = batch(
+            &server,
+            json!({"command": "rm -rf ../b && touch ran", "atomic": true}),
+        )
+        .unwrap();
+
+        assert_eq!(result["results"].as_array().unwrap().len(), 2, "{result}");
+        assert!(!tmp.path().join("c/ran").exists());
+        assert_eq!(result["rollback"]["status"], "failed");
+        assert_eq!(result["rollback"]["restored"][0]["project"], "a");
+        assert_eq!(result["rollback"]["failed"][0]["project"], "b");
+        assert!(!tmp.path().join("a/ran").exists());
     }
 
     #[test]
