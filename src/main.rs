@@ -2508,15 +2508,18 @@ mod tests {
     }
 
     #[test]
-    fn test_atomic_batch_refuses_hidden_untracked_files_and_enclosing_repos() {
+    fn test_atomic_batch_refuses_hidden_untracked_files_and_non_repos() {
         let (server, tmp) = workspace();
         let a = tmp.path().join("a");
         git(&a, &["config", "status.showUntrackedFiles", "no"]);
         std::fs::write(a.join("mine"), "my file").unwrap();
-        std::fs::create_dir(a.join("sub")).unwrap();
+        // `c` is a plain directory, not a repository of its own. (A project
+        // nested inside another, such as `a/sub`, is now refused when .meta
+        // is parsed.)
+        std::fs::create_dir(tmp.path().join("c")).unwrap();
         std::fs::write(
             tmp.path().join(".meta"),
-            r#"{"projects":{"a":"x","c":{"repo":"x","path":"a/sub"}}}"#,
+            r#"{"projects":{"a":"x","c":"x"}}"#,
         )
         .unwrap();
 
