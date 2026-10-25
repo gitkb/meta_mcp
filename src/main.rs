@@ -785,7 +785,7 @@ impl McpServer {
                         },
                         "force": {
                             "type": "boolean",
-                            "description": "Restore projects with uncommitted changes too, saving them and untracked files in a git stash first; the result gives each stash's commit id, and the commit HEAD was on if it moved (default: false)"
+                            "description": "Restore projects with uncommitted changes too, saving them and untracked files in a git stash first; the result gives each stash's commit id and the commits HEAD and the branch were on (default: false)"
                         }
                     },
                     "required": ["name"]
@@ -807,7 +807,7 @@ impl McpServer {
                         },
                         "atomic": {
                             "type": "boolean",
-                            "description": "If true, refuse to start unless every target project is the root of a clean git repository; on the first failure, stop and put each project the command reached back on its branch and commit from before. Its uncommitted changes and untracked files there are saved in a git stash, and a commit it left HEAD on is reported, both by id in the result. Ignored files, other refs and effects outside the repositories are not undone. Projects it never reached are not touched (default: false)"
+                            "description": "If true, refuse to start unless every target project is the root of a clean git repository; on the first failure, stop and put each project the command reached back on its branch and commit from before. Its uncommitted changes and untracked files there are saved in a git stash, and the commits HEAD and the branch were on are reported, all by id in the result. Ignored files, submodules, other refs and effects outside the repositories are not undone. Projects it never reached are not touched (default: false)"
                         }
                     },
                     "required": ["command"]
@@ -2162,19 +2162,28 @@ impl McpServer {
                 continue;
             }
 
-            if !force && !self.is_clean(&full_path).unwrap_or(false) {
-                failed.push(serde_json::json!({
-                    "project": proj_name,
-                    "error": "Has uncommitted changes (use force=true to override)"
-                }));
-                continue;
+            if !force {
+                let error = match self.is_clean(&full_path) {
+                    Ok(true) => None,
+                    Ok(false) => {
+                        Some("Has uncommitted changes (use force=true to override)".to_string())
+                    }
+                    Err(e) => Some(format!("{e:#}")),
+                };
+                if let Some(error) = error {
+                    failed.push(serde_json::json!({
+                        "project": proj_name,
+                        "error": error
+                    }));
+                    continue;
+                }
             }
 
             match self.restore_repo(&full_path, branch, commit) {
-                Ok((stash, left)) => restored.push(serde_json::json!({
+                Ok((stash, replaced)) => restored.push(serde_json::json!({
                     "project": proj_name,
                     "stash": stash,
-                    "replaced_head": left
+                    "replaced_commits": replaced
                 })),
                 Err(e) => failed.push(serde_json::json!({
                     "project": proj_name,
@@ -2316,10 +2325,10 @@ impl McpServer {
             for (project, (branch, commit)) in filtered.iter().zip(&before).take(results.len()) {
                 let path = meta_dir.join(&project.path);
                 match self.restore_repo(&path, branch.as_deref(), commit) {
-                    Ok((stash, left)) => restored.push(serde_json::json!({
+                    Ok((stash, replaced)) => restored.push(serde_json::json!({
                         "project": project.name,
                         "stash": stash,
-                        "replaced_head": left
+                        "replaced_commits": replaced
                     })),
                     Err(e) => failed.push(serde_json::json!({
                         "project": project.name,
@@ -2343,14 +2352,16 @@ impl McpServer {
     }
 
     /// Runs git on the repository whose root is `path` (its `.git` is
-    /// named, so git never falls back to an enclosing repository) and returns
-    /// the trimmed stdout, or an error with git's stderr.
+    /// named, so git never falls back to an enclosing repository, and it
+    /// never recurses into submodules, which are repositories of their own)
+    /// and returns the trimmed stdout, or an error with git's stderr.
     fn repo_git(&self, path: &std::path::Path, args: &[&str]) -> Result<String> {
         let mut git_dir = std::ffi::OsString::from("--git-dir=");
         git_dir.push(path.join(".git"));
         let mut work_tree = std::ffi::OsString::from("--work-tree=");
         work_tree.push(path);
         let output = Command::new("git")
+            .args(["-c", "submodule.recurse=false"])
             .arg(git_dir)
             .arg(work_tree)
             .args(args)
@@ -2377,16 +2388,29 @@ impl McpServer {
     }
 
     /// Puts the repository at `path` back on `branch` (detached when `None`)
-    /// at `commit`. Uncommitted changes and untracked files are first saved in
-    /// a stash entry; ignored files are not. Returns that stash's commit id and
-    /// the commit HEAD left behind, when they exist, so both can be recovered.
+    /// at `commit`, recreating the branch if it is gone. Uncommitted changes
+    /// and untracked files are first saved in a stash entry; ignored files are
+    /// not. Returns that stash's commit id and the commits HEAD and the branch
+    /// were on, other than `commit`, so all of them can be recovered.
     fn restore_repo(
         &self,
         path: &std::path::Path,
         branch: Option<&str>,
         commit: &str,
-    ) -> Result<(Option<String>, Option<String>)> {
-        let head = self.repo_git(path, &["rev-parse", "--verify", "HEAD"])?;
+    ) -> Result<(Option<String>, Vec<String>)> {
+        let commit = self.repo_git(
+            path,
+            &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
+        )?;
+        let mut replaced = vec![self.repo_git(path, &["rev-parse", "--verify", "HEAD"])?];
+        if let Some(branch) = branch {
+            // Empty when the branch is gone.
+            let tip = format!("refs/heads/{branch}");
+            replaced.push(self.repo_git(path, &["for-each-ref", "--format=%(objectname)", &tip])?);
+        }
+        replaced.retain(|replaced| !replaced.is_empty() && *replaced != commit);
+        replaced.dedup();
+
         // `stash list` is empty, not an error, when there is no stash.
         let stash_head = || self.repo_git(path, &["stash", "list", "-n1", "--format=%H"]);
         let old_stash = stash_head()?;
@@ -2404,17 +2428,16 @@ impl McpServer {
         let stash = stash_head()
             .context("uncommitted changes may be in a new stash entry, see `git stash list`")?;
         let stash = (stash != old_stash).then_some(stash);
-        let left = (head != commit).then_some(head);
-        self.repo_git(
-            path,
-            &["checkout", "--quiet", branch.unwrap_or(commit), "--"],
-        )
-        .and_then(|_| self.repo_git(path, &["reset", "--quiet", "--hard", commit]))
-        .with_context(|| match &stash {
-            Some(stash) => format!("uncommitted changes are saved in stash {stash}"),
-            None => "there were no uncommitted changes to save".to_string(),
-        })?;
-        Ok((stash, left))
+        let checkout = match branch {
+            Some(branch) => ["checkout", "--quiet", "-B", branch, &commit, "--"].to_vec(),
+            None => ["checkout", "--quiet", "--detach", &commit, "--"].to_vec(),
+        };
+        self.repo_git(path, &checkout)
+            .with_context(|| match &stash {
+                Some(stash) => format!("uncommitted changes are saved in stash {stash}"),
+                None => "there were no uncommitted changes to save".to_string(),
+            })?;
+        Ok((stash, replaced))
     }
 
     fn git_output(&self, path: &std::path::Path, args: &[&str]) -> Result<String> {
@@ -2656,10 +2679,13 @@ mod tests {
         assert_eq!(result["rollback"]["status"], "success", "{result}");
         let stash = result["rollback"]["restored"][0]["stash"].as_str().unwrap();
         assert_eq!(git(&a, &["show", &format!("{stash}^3:new")]), "");
-        let left = result["rollback"]["restored"][0]["replaced_head"]
-            .as_str()
-            .unwrap();
-        assert_eq!(git(&a, &["show", &format!("{left}:README")]), "changed\n");
+        let replaced = &result["rollback"]["restored"][0]["replaced_commits"];
+        assert_eq!(replaced.as_array().unwrap().len(), 1, "{replaced}");
+        let replaced = replaced[0].as_str().unwrap();
+        assert_eq!(
+            git(&a, &["show", &format!("{replaced}:README")]),
+            "changed\n"
+        );
         assert!(!a.join("new").exists());
         assert_eq!(git(&a, &["rev-parse", "HEAD"]), head);
         assert_eq!(git(&a, &["branch", "--show-current"]), "main\n");
@@ -2759,6 +2785,73 @@ mod tests {
         assert_eq!(result["rollback"]["restored"][0]["project"], "a");
         assert_eq!(result["rollback"]["failed"][0]["project"], "b");
         assert!(!tmp.path().join("a/ran").exists());
+    }
+
+    #[test]
+    fn test_rollback_reports_the_branch_tip_and_recreates_a_deleted_branch() {
+        let (server, tmp) = workspace();
+        let a = tmp.path().join("a");
+        std::fs::write(tmp.path().join(".meta"), r#"{"projects":{"a":"x"}}"#).unwrap();
+        let head = git(&a, &["rev-parse", "HEAD"]);
+        let commit =
+            "echo x > README && git -c user.name=t -c user.email=t@example.com commit -qam x";
+
+        // HEAD is back on the old commit, but the branch tip has moved on.
+        let result = batch(
+            &server,
+            json!({"command": format!("{commit} && git checkout -q HEAD~1 && false"), "atomic": true}),
+        )
+        .unwrap();
+        let replaced = result["rollback"]["restored"][0]["replaced_commits"][0]
+            .as_str()
+            .unwrap();
+        assert_eq!(git(&a, &["show", &format!("{replaced}:README")]), "x\n");
+        assert_eq!(git(&a, &["branch", "--show-current"]), "main\n");
+        assert_eq!(git(&a, &["rev-parse", "HEAD"]), head);
+
+        let result = batch(
+            &server,
+            json!({"command": "git checkout -q -b tmp && git branch -q -D main && false", "atomic": true}),
+        )
+        .unwrap();
+        assert_eq!(result["rollback"]["status"], "success", "{result}");
+        assert_eq!(git(&a, &["branch", "--show-current"]), "main\n");
+        assert_eq!(git(&a, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn test_rollback_never_moves_a_submodule() {
+        let (server, tmp) = workspace();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let b = b.to_str().unwrap();
+        git(
+            &a,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                b,
+                "sub",
+            ],
+        );
+        git(&a, &["commit", "-qm", "sub"]);
+        git(&a, &["config", "submodule.recurse", "true"]);
+        std::fs::write(tmp.path().join(".meta"), r#"{"projects":{"a":"x"}}"#).unwrap();
+
+        // The command moves the submodule on and commits that in `a`.
+        let id = "git -c user.name=t -c user.email=t@example.com";
+        let command = format!(
+            "{id} -C sub commit -q --allow-empty -m y && git add sub && {id} commit -qm bump && false"
+        );
+        let result = batch(&server, json!({"command": command, "atomic": true})).unwrap();
+
+        assert_eq!(result["rollback"]["status"], "success", "{result}");
+        let sub = a.join("sub");
+        assert_eq!(git(&sub, &["log", "-1", "--format=%s"]), "y\n");
+        assert_eq!(git(&sub, &["branch", "--show-current"]), "main\n");
     }
 
     #[test]
