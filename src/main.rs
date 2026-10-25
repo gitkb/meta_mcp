@@ -2228,11 +2228,15 @@ impl McpServer {
             let mut refused = Vec::new();
             for project in &filtered {
                 let path = meta_dir.join(&project.path);
-                let commit = self.repo_git(&path, &["rev-parse", "--verify", "HEAD"]);
-                match (commit, self.is_clean(&path)) {
-                    (Ok(commit), Ok(true)) => {
-                        before.push((git_utils::current_branch(&path), commit))
-                    }
+                // The branch is empty for a detached HEAD.
+                let head = self
+                    .repo_git(&path, &["rev-parse", "--verify", "HEAD"])
+                    .and_then(|commit| {
+                        let branch = self.repo_git(&path, &["branch", "--show-current"])?;
+                        Ok(((!branch.is_empty()).then_some(branch), commit))
+                    });
+                match (head, self.is_clean(&path)) {
+                    (Ok(head), Ok(true)) => before.push(head),
                     (Ok(_), Ok(false)) => refused.push(format!(
                         "{}: has uncommitted changes or untracked files",
                         project.name
