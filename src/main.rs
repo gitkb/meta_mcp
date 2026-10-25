@@ -2682,6 +2682,25 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_runs_its_argv_with_no_shell() {
+        let (server, tmp) = workspace();
+        let args = json!({"command": ["git", "rev-parse", "--sq-quote", "$(touch PWNED)", "a b"]});
+        let result: serde_json::Value =
+            serde_json::from_str(&server.tool_batch_execute(&args).unwrap()).unwrap();
+        assert_eq!(
+            result["results"][0]["stdout"], " '$(touch PWNED)' 'a b'\n",
+            "{result}"
+        );
+        for dir in [
+            tmp.path().to_path_buf(),
+            tmp.path().join("a"),
+            tmp.path().join("b"),
+        ] {
+            assert!(!dir.join("PWNED").exists());
+        }
+    }
+
+    #[test]
     fn test_atomic_batch_never_touches_projects_it_does_not_target() {
         let (server, tmp) = workspace();
         let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
