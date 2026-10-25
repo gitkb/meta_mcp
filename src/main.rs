@@ -1281,9 +1281,13 @@ impl McpServer {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
 
-        let files = string_list(args, "files")?
-            .filter(|files| !files.is_empty())
-            .unwrap_or_else(|| vec![".".to_string()]);
+        let files = match string_list(args, "files")? {
+            None => vec![".".to_string()],
+            Some(files) if files.is_empty() => {
+                anyhow::bail!("'files' is empty: name the paths to add")
+            }
+            Some(files) => files,
+        };
 
         let mut cmd = Command::new("meta");
         cmd.arg("--json");
