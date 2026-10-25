@@ -750,50 +750,6 @@ impl McpServer {
                 }),
             },
             Tool {
-                name: "meta_snapshot_create".to_string(),
-                description: "Create a snapshot of the current workspace state for later rollback".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Name for the snapshot"
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Optional description"
-                        }
-                    },
-                    "required": ["name"]
-                }),
-            },
-            Tool {
-                name: "meta_snapshot_list".to_string(),
-                description: "List all available workspace snapshots".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }),
-            },
-            Tool {
-                name: "meta_snapshot_restore".to_string(),
-                description: "Restore workspace to a previously saved snapshot".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Name of the snapshot to restore"
-                        },
-                        "force": {
-                            "type": "boolean",
-                            "description": "Restore projects with uncommitted changes too, saving them and untracked files in a git stash first; the result gives each stash's commit id and the commits HEAD and the branch were on (default: false)"
-                        }
-                    },
-                    "required": ["name"]
-                }),
-            },
-            Tool {
                 name: "meta_batch_execute".to_string(),
                 description: "Execute a command across projects, optionally rolling back the projects it ran in if it fails".to_string(),
                 input_schema: serde_json::json!({
@@ -864,9 +820,6 @@ impl McpServer {
             "meta_workspace_state" => self.tool_workspace_state(&arguments),
             "meta_analyze_impact" => self.tool_analyze_impact(&arguments),
             "meta_execution_order" => self.tool_execution_order(&arguments),
-            "meta_snapshot_create" => self.tool_snapshot_create(&arguments),
-            "meta_snapshot_list" => self.tool_snapshot_list(&arguments),
-            "meta_snapshot_restore" => self.tool_snapshot_restore(&arguments),
             "meta_batch_execute" => self.tool_batch_execute(&arguments),
             _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
         };
@@ -2021,191 +1974,6 @@ impl McpServer {
         }))?)
     }
 
-    fn tool_snapshot_create(&self, args: &serde_json::Value) -> Result<String> {
-        let meta_dir = self
-            .meta_dir
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
-
-        let name = args
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' argument"))?;
-
-        let description = args.get("description").and_then(|v| v.as_str());
-
-        let projects = self.load_projects(meta_dir)?;
-        let mut project_snapshots = Vec::new();
-
-        for project in &projects {
-            let project_path = meta_dir.join(&project.path);
-            if !project_path.exists() || !project_path.join(".git").exists() {
-                continue;
-            }
-
-            // `None` (null) for a detached HEAD.
-            let branch = git_utils::current_branch(&project_path);
-            let commit = self
-                .git_output(&project_path, &["rev-parse", "HEAD"])
-                .unwrap_or_else(|_| "unknown".to_string());
-            let is_dirty = git_utils::is_dirty(&project_path).unwrap_or(false);
-
-            project_snapshots.push(serde_json::json!({
-                "name": project.name,
-                "path": project.path,
-                "branch": branch,
-                "commit": commit,
-                "is_dirty": is_dirty
-            }));
-        }
-
-        let snapshot = serde_json::json!({
-            "name": name,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "description": description,
-            "meta_dir": meta_dir.to_string_lossy(),
-            "projects": project_snapshots
-        });
-
-        // Save snapshot
-        let snapshots_dir = meta_dir.join(".meta-snapshots");
-        std::fs::create_dir_all(&snapshots_dir)?;
-        let filename = format!("{}.json", name.replace(['/', '\\', ' '], "_"));
-        let snapshot_path = snapshots_dir.join(&filename);
-        std::fs::write(&snapshot_path, serde_json::to_string_pretty(&snapshot)?)?;
-
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "status": "created",
-            "name": name,
-            "path": snapshot_path.to_string_lossy(),
-            "projects_count": project_snapshots.len()
-        }))?)
-    }
-
-    fn tool_snapshot_list(&self, _args: &serde_json::Value) -> Result<String> {
-        let meta_dir = self
-            .meta_dir
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
-
-        let snapshots_dir = meta_dir.join(".meta-snapshots");
-        let mut snapshots = Vec::new();
-
-        if snapshots_dir.exists() {
-            for entry in std::fs::read_dir(&snapshots_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().map(|e| e == "json").unwrap_or(false) {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(snapshot) = serde_json::from_str::<serde_json::Value>(&content) {
-                            snapshots.push(serde_json::json!({
-                                "name": snapshot.get("name"),
-                                "created_at": snapshot.get("created_at"),
-                                "description": snapshot.get("description"),
-                                "projects_count": snapshot.get("projects").and_then(|p| p.as_array()).map(|a| a.len())
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "snapshots": snapshots,
-            "count": snapshots.len()
-        }))?)
-    }
-
-    fn tool_snapshot_restore(&self, args: &serde_json::Value) -> Result<String> {
-        let meta_dir = self
-            .meta_dir
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
-
-        let name = args
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' argument"))?;
-
-        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-
-        // Load snapshot
-        let snapshots_dir = meta_dir.join(".meta-snapshots");
-        let filename = format!("{}.json", name.replace(['/', '\\', ' '], "_"));
-        let snapshot_path = snapshots_dir.join(&filename);
-
-        if !snapshot_path.exists() {
-            return Err(anyhow::anyhow!("Snapshot '{name}' not found"));
-        }
-
-        let content = std::fs::read_to_string(&snapshot_path)?;
-        let snapshot: serde_json::Value = serde_json::from_str(&content)?;
-
-        let projects = snapshot
-            .get("projects")
-            .and_then(|p| p.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Invalid snapshot format"))?;
-
-        let mut restored = Vec::new();
-        let mut failed = Vec::new();
-
-        for project in projects {
-            let proj_name = project
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let proj_path = project.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let branch = project.get("branch").and_then(|v| v.as_str());
-            let commit = project.get("commit").and_then(|v| v.as_str()).unwrap_or("");
-
-            let full_path = meta_dir.join(proj_path);
-            if !full_path.exists() {
-                failed.push(serde_json::json!({
-                    "project": proj_name,
-                    "error": "Path does not exist"
-                }));
-                continue;
-            }
-
-            if !force {
-                let error = match self.is_clean(&full_path) {
-                    Ok(true) => None,
-                    Ok(false) => {
-                        Some("Has uncommitted changes (use force=true to override)".to_string())
-                    }
-                    Err(e) => Some(format!("{e:#}")),
-                };
-                if let Some(error) = error {
-                    failed.push(serde_json::json!({
-                        "project": proj_name,
-                        "error": error
-                    }));
-                    continue;
-                }
-            }
-
-            match self.restore_repo(&full_path, branch, commit) {
-                Ok((stash, replaced)) => restored.push(serde_json::json!({
-                    "project": proj_name,
-                    "stash": stash,
-                    "replaced_commits": replaced
-                })),
-                Err(e) => failed.push(serde_json::json!({
-                    "project": proj_name,
-                    "error": format!("Failed to restore: {e:#}")
-                })),
-            }
-        }
-
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "status": if failed.is_empty() { "success" } else { "partial" },
-            "restored": restored,
-            "failed": failed,
-            "restored_count": restored.len(),
-            "failed_count": failed.len()
-        }))?)
-    }
-
     fn tool_batch_execute(&self, args: &serde_json::Value) -> Result<String> {
         let meta_dir = self
             .meta_dir
@@ -2444,20 +2212,6 @@ impl McpServer {
                 None => "there were no uncommitted changes to save".to_string(),
             })?;
         Ok((stash, replaced))
-    }
-
-    fn git_output(&self, path: &std::path::Path, args: &[&str]) -> Result<String> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .output()
-            .with_context(|| format!("Failed to run git {args:?}"))?;
-
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-        } else {
-            Err(anyhow::anyhow!("Git command failed"))
-        }
     }
 
     // ========================================================================
@@ -2896,40 +2650,6 @@ mod tests {
     }
 
     #[test]
-    fn test_force_restore_keeps_changes_in_a_stash_it_names() {
-        let (server, tmp) = workspace();
-        let a = tmp.path().join("a");
-        std::fs::write(a.join("notes"), "tracked").unwrap();
-        git(&a, &["add", "notes"]);
-        git(&a, &["commit", "-qm", "notes"]);
-        server
-            .tool_snapshot_create(&json!({"name": "before"}))
-            .unwrap();
-        git(&a, &["rm", "-q", "notes"]);
-        git(&a, &["commit", "-qm", "no notes"]);
-        // An untracked file where the snapshot has a tracked one.
-        std::fs::write(a.join("notes"), "my untracked notes").unwrap();
-        std::fs::write(a.join("README"), "my edit").unwrap();
-
-        let result: serde_json::Value = serde_json::from_str(
-            &server
-                .tool_snapshot_restore(&json!({"name": "before", "force": true}))
-                .unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(result["status"], "success", "{result}");
-        let stash = result["restored"][0]["stash"].as_str().unwrap();
-        assert_eq!(std::fs::read_to_string(a.join("README")).unwrap(), "a");
-        assert_eq!(std::fs::read_to_string(a.join("notes")).unwrap(), "tracked");
-        assert_eq!(git(&a, &["show", &format!("{stash}:README")]), "my edit");
-        assert_eq!(
-            git(&a, &["show", &format!("{stash}^3:notes")]),
-            "my untracked notes"
-        );
-    }
-
-    #[test]
     fn test_server_creation() {
         let server = McpServer::new();
         // Server should be created (meta_dir may or may not be set depending on cwd)
@@ -2997,13 +2717,10 @@ mod tests {
         assert!(tool_names.contains(&"meta_workspace_state"));
         assert!(tool_names.contains(&"meta_analyze_impact"));
         assert!(tool_names.contains(&"meta_execution_order"));
-        assert!(tool_names.contains(&"meta_snapshot_create"));
-        assert!(tool_names.contains(&"meta_snapshot_list"));
-        assert!(tool_names.contains(&"meta_snapshot_restore"));
         assert!(tool_names.contains(&"meta_batch_execute"));
 
-        // Verify total count (4 core + 10 git + 4 build + 3 discovery + 8 AI = 29)
-        assert_eq!(tool_names.len(), 29);
+        // Verify total count (4 core + 10 git + 4 build + 3 discovery + 5 AI = 26)
+        assert_eq!(tool_names.len(), 26);
     }
 
     #[test]
