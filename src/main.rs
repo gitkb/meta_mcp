@@ -53,12 +53,10 @@ struct JsonRpcResponse {
     error: Option<JsonRpcError>,
 }
 
-/// What one input line gets back: a response, or an array for a batch.
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum Reply {
-    One(JsonRpcResponse),
-    Batch(Vec<JsonRpcResponse>),
+/// Writes `response` as one line of JSON.
+fn write_line(output: &mut impl Write, response: &JsonRpcResponse) -> Result<()> {
+    serde_json::to_writer(&mut *output, response)?;
+    Ok(output.write_all(b"\n")?)
 }
 
 /// JSON-RPC 2.0 ids are strings, numbers or null.
@@ -168,79 +166,90 @@ impl McpServer {
             {
                 return Ok(());
             }
-            let reply = if line.len() as u64 > MAX_LINE_BYTES && !line.ends_with(b"\n") {
+            if line.len() as u64 > MAX_LINE_BYTES && !line.ends_with(b"\n") {
                 input.skip_until(b'\n')?;
-                Some(Reply::One(
-                    self.parse_error("Request too large".to_string()),
-                ))
+                write_line(
+                    &mut output,
+                    &self.parse_error("Request too large".to_string()),
+                )?;
             } else {
-                self.handle_line(&line)
-            };
-            if let Some(reply) = reply {
-                serde_json::to_writer(&mut output, &reply)?;
-                output.write_all(b"\n")?;
-                output.flush()?;
+                self.handle_line(&line, &mut output)?;
             }
+            output.flush()?;
         }
     }
 
-    /// Replies to one line: a request, a notification (no reply) or a batch.
-    fn handle_line(&self, line: &[u8]) -> Option<Reply> {
+    /// Writes the reply to one line: a request, a notification (no reply), or
+    /// a batch, whose replies are written one by one into a JSON array.
+    fn handle_line(&self, line: &[u8], output: &mut impl Write) -> Result<()> {
         let Ok(text) = std::str::from_utf8(line) else {
-            return Some(Reply::One(
-                self.parse_error("Request is not valid UTF-8".to_string()),
-            ));
+            return write_line(
+                output,
+                &self.parse_error("Request is not valid UTF-8".to_string()),
+            );
         };
+        // A blank line holds no message: it is framing, not a request.
         if text.trim().is_empty() {
-            return None;
+            return Ok(());
         }
-        let message = match serde_json::from_str(text) {
-            Ok(message) => message,
-            Err(e) => return Some(Reply::One(self.parse_error(e.to_string()))),
-        };
-        match message {
-            serde_json::Value::Array(batch) if batch.is_empty() => {
-                Some(Reply::One(self.error_response(
+        match serde_json::from_str(text) {
+            Err(e) => write_line(output, &self.parse_error(e.to_string())),
+            Ok(serde_json::Value::Array(batch)) if batch.is_empty() => write_line(
+                output,
+                &self.error_response(
                     Some(serde_json::Value::Null),
                     -32600,
                     "Invalid Request: empty batch".to_string(),
-                )))
+                ),
+            ),
+            Ok(serde_json::Value::Array(batch)) => {
+                let mut separator = b"[";
+                for response in batch.into_iter().filter_map(|m| self.handle_message(m)) {
+                    output.write_all(separator)?;
+                    serde_json::to_writer(&mut *output, &response)?;
+                    separator = b",";
+                }
+                if separator == b"," {
+                    output.write_all(b"]\n")?;
+                }
+                Ok(())
             }
-            serde_json::Value::Array(batch) => {
-                let replies: Vec<_> = batch
-                    .into_iter()
-                    .filter_map(|message| self.handle_message(message))
-                    .collect();
-                (!replies.is_empty()).then_some(Reply::Batch(replies))
-            }
-            message => self.handle_message(message).map(Reply::One),
+            Ok(message) => match self.handle_message(message) {
+                Some(response) => write_line(output, &response),
+                None => Ok(()),
+            },
         }
     }
 
     /// Replies to one JSON-RPC message, or `None` for a valid notification.
     fn handle_message(&self, message: serde_json::Value) -> Option<JsonRpcResponse> {
         let id = message.get("id").filter(|id| valid_id(id)).cloned();
-        let invalid = |reason: String| {
+        let invalid = |reason: &str| {
             Some(self.error_response(
                 Some(id.clone().unwrap_or(serde_json::Value::Null)),
                 -32600,
                 format!("Invalid Request: {reason}"),
             ))
         };
-        let request: JsonRpcRequest = match serde_json::from_value(message) {
-            Ok(request) => request,
-            Err(e) => return invalid(e.to_string()),
-        };
-        if request.jsonrpc != "2.0" {
-            return invalid("jsonrpc must be \"2.0\"".to_string());
+        if !message.is_object() {
+            return invalid("not an object");
         }
-        if !request.id.as_ref().is_none_or(valid_id) {
-            return invalid("id must be a string, number or null".to_string());
+        if message.get("jsonrpc") != Some(&serde_json::json!("2.0")) {
+            return invalid("jsonrpc must be \"2.0\"");
         }
-        if !(request.params.is_null() || request.params.is_object() || request.params.is_array()) {
-            return invalid("params must be an object or array".to_string());
+        if message.get("id").is_some_and(|id| !valid_id(id)) {
+            return invalid("id must be a string, number or null");
         }
-        self.handle_request(&request)
+        if message
+            .get("params")
+            .is_some_and(|params| !(params.is_object() || params.is_array()))
+        {
+            return invalid("params must be an object or array");
+        }
+        match serde_json::from_value(message) {
+            Ok(request) => self.handle_request(&request),
+            Err(e) => invalid(&e.to_string()),
+        }
     }
 
     fn parse_error(&self, message: String) -> JsonRpcResponse {
@@ -776,7 +785,7 @@ impl McpServer {
                         },
                         "force": {
                             "type": "boolean",
-                            "description": "Restore projects with uncommitted changes too, saving tracked changes in a git stash first; the result gives each stash's commit id (default: false)"
+                            "description": "Restore projects with uncommitted changes too, saving them and untracked files in a git stash first; the result gives each stash's commit id (default: false)"
                         }
                     },
                     "required": ["name"]
@@ -798,7 +807,7 @@ impl McpServer {
                         },
                         "atomic": {
                             "type": "boolean",
-                            "description": "If true, refuse to start unless every target project is a clean git repository; on the first failure, stop and reset each project the command ran in to its branch and commit from before, discarding its changes to tracked files. Untracked files it created are left in place and listed. Projects it never reached are not touched (default: false)"
+                            "description": "If true, refuse to start unless every target project is a clean git repository; on the first failure, stop and put each project the command ran in back on its branch and commit from before. What the command changed there, untracked files included, is saved in a git stash named in the result; ignored files are not. Projects it never reached are not touched (default: false)"
                         }
                     },
                     "required": ["command"]
@@ -2153,9 +2162,7 @@ impl McpServer {
                 continue;
             }
 
-            // Check if dirty and not force
-            let is_dirty = git_utils::is_dirty(&full_path).unwrap_or(false);
-            if is_dirty && !force {
+            if !force && !self.is_clean(&full_path).unwrap_or(false) {
                 failed.push(serde_json::json!({
                     "project": proj_name,
                     "error": "Has uncommitted changes (use force=true to override)"
@@ -2163,31 +2170,14 @@ impl McpServer {
                 continue;
             }
 
-            // Keep tracked changes in a stash before the reset discards them.
-            let stash = if is_dirty {
-                match self.stash(&full_path, "meta-restore-backup") {
-                    Ok(stash) => stash,
-                    Err(e) => {
-                        failed.push(serde_json::json!({
-                            "project": proj_name,
-                            "error": format!("Failed to stash uncommitted changes, left untouched: {e}")
-                        }));
-                        continue;
-                    }
-                }
-            } else {
-                None
-            };
-
             match self.restore_repo(&full_path, branch, commit) {
-                Ok(()) => restored.push(serde_json::json!({
+                Ok(stash) => restored.push(serde_json::json!({
                     "project": proj_name,
                     "stash": stash
                 })),
                 Err(e) => failed.push(serde_json::json!({
                     "project": proj_name,
-                    "error": format!("Failed to restore: {e}"),
-                    "stash": stash
+                    "error": format!("Failed to restore: {e:#}")
                 })),
             }
         }
@@ -2237,17 +2227,22 @@ impl McpServer {
             let mut refused = Vec::new();
             for project in &filtered {
                 let path = meta_dir.join(&project.path);
-                let commit = self.git_output(&path, &["rev-parse", "--verify", "HEAD"]);
-                match (commit, git_utils::is_dirty(&path)) {
-                    (Ok(commit), Some(false)) => {
+                // `.git` here, so git never acts on an enclosing repository.
+                let commit = if path.join(".git").exists() {
+                    self.git_output(&path, &["rev-parse", "--verify", "HEAD"])
+                } else {
+                    Err(anyhow::anyhow!("no .git"))
+                };
+                match (commit, self.is_clean(&path)) {
+                    (Ok(commit), Ok(true)) => {
                         before.push((git_utils::current_branch(&path), commit))
                     }
-                    (Ok(_), Some(true)) => refused.push(format!(
+                    (Ok(_), Ok(false)) => refused.push(format!(
                         "{}: has uncommitted changes or untracked files",
                         project.name
                     )),
                     _ => refused.push(format!(
-                        "{}: not a git repository with a commit",
+                        "{}: not the root of a git repository with a commit",
                         project.name
                     )),
                 }
@@ -2318,16 +2313,13 @@ impl McpServer {
             for (project, (branch, commit)) in filtered.iter().zip(&before).take(results.len()) {
                 let path = meta_dir.join(&project.path);
                 match self.restore_repo(&path, branch.as_deref(), commit) {
-                    Ok(()) => restored.push(serde_json::json!({
+                    Ok(stash) => restored.push(serde_json::json!({
                         "project": project.name,
-                        "untracked_files_left": self
-                            .git_output(&path, &["ls-files", "--others", "--exclude-standard"])
-                            .map(|files| files.lines().map(str::to_string).collect::<Vec<_>>())
-                            .unwrap_or_default()
+                        "stash": stash
                     })),
                     Err(e) => failed.push(serde_json::json!({
                         "project": project.name,
-                        "error": e.to_string()
+                        "error": format!("{e:#}")
                     })),
                 }
             }
@@ -2346,31 +2338,50 @@ impl McpServer {
         }))?)
     }
 
-    /// Saves the tracked changes in `path` as a stash entry without touching
-    /// the working tree, and returns its commit id (`None` if there are none).
-    fn stash(&self, path: &std::path::Path, message: &str) -> Result<Option<String>> {
-        let commit = self.git_output(path, &["stash", "create", message])?;
-        if commit.is_empty() {
-            return Ok(None);
-        }
-        self.git_command(path, &["stash", "store", "-m", message, &commit])?;
-        Ok(Some(commit))
+    /// Whether `path` has no uncommitted changes and no untracked files,
+    /// whatever `status.showUntrackedFiles` says.
+    fn is_clean(&self, path: &std::path::Path) -> Result<bool> {
+        let status =
+            self.git_output(path, &["status", "--porcelain", "--untracked-files=normal"])?;
+        Ok(status.is_empty())
     }
 
     /// Puts the repository at `path` back on `branch` (detached when `None`)
-    /// at `commit`, discarding changes to tracked files. Untracked files stay.
+    /// at `commit`. Uncommitted changes and untracked files are first saved
+    /// in a stash entry, whose commit id it returns; ignored files are not.
     fn restore_repo(
         &self,
         path: &std::path::Path,
         branch: Option<&str>,
         commit: &str,
-    ) -> Result<()> {
-        self.git_command(path, &["reset", "--quiet", "--hard"])?;
+    ) -> Result<Option<String>> {
+        let stash_head = || {
+            self.git_output(path, &["rev-parse", "--quiet", "--verify", "refs/stash"])
+                .ok()
+        };
+        let old_stash = stash_head();
+        self.git_command(
+            path,
+            &[
+                "stash",
+                "push",
+                "--include-untracked",
+                "--quiet",
+                "-m",
+                "meta-restore-backup",
+            ],
+        )?;
+        let stash = stash_head().filter(|stash| old_stash.as_ref() != Some(stash));
         self.git_command(
             path,
             &["checkout", "--quiet", branch.unwrap_or(commit), "--"],
-        )?;
-        self.git_command(path, &["reset", "--quiet", "--hard", commit])
+        )
+        .and_then(|()| self.git_command(path, &["reset", "--quiet", "--hard", commit]))
+        .with_context(|| match &stash {
+            Some(stash) => format!("uncommitted changes are saved in stash {stash}"),
+            None => "no uncommitted changes".to_string(),
+        })?;
+        Ok(stash)
     }
 
     fn git_output(&self, path: &std::path::Path, args: &[&str]) -> Result<String> {
@@ -2528,6 +2539,11 @@ mod tests {
                 -32600,
                 json!(9),
             ),
+            (
+                br#"{"jsonrpc":"2.0","id":9,"method":"initialize","params":null}"#,
+                -32600,
+                json!(9),
+            ),
             (br#"{"jsonrpc":"2.0","method":7}"#, -32600, json!(null)),
             (
                 br#"{"jsonrpc":"2.0","id":10,"method":"no/such/method"}"#,
@@ -2549,7 +2565,7 @@ mod tests {
     #[test]
     fn test_batch_gets_an_array_of_replies() {
         let replies = serve(
-            br#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","method":"notifications/initialized"},1]
+            br#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","method":"notifications/initialized"},["2.0",2,"tools/list",{}]]
 [{"jsonrpc":"2.0","method":"notifications/initialized"}]
 "#,
         );
@@ -2617,11 +2633,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(result["rollback"]["status"], "success", "{result}");
-        assert_eq!(
-            result["rollback"]["restored"][0]["untracked_files_left"],
-            json!(["new"])
-        );
+        let stash = result["rollback"]["restored"][0]["stash"].as_str().unwrap();
+        assert_eq!(git(&a, &["show", &format!("{stash}^3:new")]), "");
+        assert!(!a.join("new").exists());
         assert_eq!(git(&a, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(&a, &["branch", "--show-current"]), "main\n");
         assert_eq!(std::fs::read_to_string(a.join("README")).unwrap(), "a");
         assert_eq!(
             std::fs::read_to_string(b.join("README")).unwrap(),
@@ -2646,6 +2662,33 @@ mod tests {
     }
 
     #[test]
+    fn test_atomic_batch_refuses_hidden_untracked_files_and_enclosing_repos() {
+        let (server, tmp) = workspace();
+        let a = tmp.path().join("a");
+        git(&a, &["config", "status.showUntrackedFiles", "no"]);
+        std::fs::write(a.join("mine"), "my file").unwrap();
+        std::fs::create_dir(a.join("sub")).unwrap();
+        std::fs::write(
+            tmp.path().join(".meta"),
+            r#"{"projects":{"a":"x","c":{"repo":"x","path":"a/sub"}}}"#,
+        )
+        .unwrap();
+
+        let err = batch(&server, json!({"command": "touch ran", "atomic": true})).unwrap_err();
+
+        assert!(
+            err.to_string().contains("a: has uncommitted changes"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("c: not the root of a git repository"),
+            "{err}"
+        );
+        assert!(!a.join("ran").exists());
+    }
+
+    #[test]
     fn test_atomic_batch_reports_a_failed_rollback() {
         let (server, _tmp) = workspace();
 
@@ -2665,9 +2708,16 @@ mod tests {
     fn test_force_restore_keeps_changes_in_a_stash_it_names() {
         let (server, tmp) = workspace();
         let a = tmp.path().join("a");
+        std::fs::write(a.join("notes"), "tracked").unwrap();
+        git(&a, &["add", "notes"]);
+        git(&a, &["commit", "-qm", "notes"]);
         server
             .tool_snapshot_create(&json!({"name": "before"}))
             .unwrap();
+        git(&a, &["rm", "-q", "notes"]);
+        git(&a, &["commit", "-qm", "no notes"]);
+        // An untracked file where the snapshot has a tracked one.
+        std::fs::write(a.join("notes"), "my untracked notes").unwrap();
         std::fs::write(a.join("README"), "my edit").unwrap();
 
         let result: serde_json::Value = serde_json::from_str(
@@ -2680,10 +2730,11 @@ mod tests {
         assert_eq!(result["status"], "success", "{result}");
         let stash = result["restored"][0]["stash"].as_str().unwrap();
         assert_eq!(std::fs::read_to_string(a.join("README")).unwrap(), "a");
-        git(&a, &["stash", "apply", "-q", stash]);
+        assert_eq!(std::fs::read_to_string(a.join("notes")).unwrap(), "tracked");
+        assert_eq!(git(&a, &["show", &format!("{stash}:README")]), "my edit");
         assert_eq!(
-            std::fs::read_to_string(a.join("README")).unwrap(),
-            "my edit"
+            git(&a, &["show", &format!("{stash}^3:notes")]),
+            "my untracked notes"
         );
     }
 
