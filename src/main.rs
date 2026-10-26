@@ -138,14 +138,11 @@ struct McpServer {
 }
 
 impl McpServer {
-    fn new() -> Self {
+    fn new() -> Result<Self> {
         // Find .meta config in current directory or parents
-        let meta_dir = std::env::current_dir()
-            .ok()
-            .and_then(|dir| config::find_meta_config(&dir, None))
-            .and_then(|(config_path, _)| config_path.parent().map(|dir| dir.to_path_buf()));
-
-        Self { meta_dir }
+        let cwd = std::env::current_dir()?;
+        let meta_dir = config::find_workspace_root(&cwd)?;
+        Ok(Self { meta_dir })
     }
 
     fn run(&self) -> Result<()> {
@@ -2241,7 +2238,7 @@ impl McpServer {
     // ========================================================================
 
     fn load_projects(&self, meta_dir: &std::path::Path) -> Result<Vec<ProjectInfo>> {
-        let (config_path, _) = config::find_meta_config(meta_dir, None)
+        let (config_path, _) = config::find_meta_config(meta_dir, None)?
             .ok_or_else(|| anyhow::anyhow!("No meta config found"))?;
         let (projects, _ignore) = config::parse_meta_config(&config_path)?;
         Ok(projects)
@@ -2297,7 +2294,7 @@ fn repo_command(
 }
 
 fn main() -> Result<()> {
-    McpServer::new().run()
+    McpServer::new()?.run()
 }
 
 #[cfg(test)]
@@ -2791,7 +2788,7 @@ mod tests {
 
     #[test]
     fn test_server_creation() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         // Server should be created (meta_dir may or may not be set depending on cwd)
         // We just verify it doesn't panic and returns a valid server
         drop(server);
@@ -2799,7 +2796,7 @@ mod tests {
 
     #[test]
     fn test_initialize_response() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         let result = server.handle_initialize().unwrap();
 
         let result_obj = result.as_object().unwrap();
@@ -2810,7 +2807,7 @@ mod tests {
 
     #[test]
     fn test_list_tools_response() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         let result = server.handle_list_tools().unwrap();
 
         let result_obj = result.as_object().unwrap();
@@ -2865,7 +2862,7 @@ mod tests {
 
     #[test]
     fn test_ok_response() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         let response = server.ok_response(
             Some(serde_json::json!(1)),
             serde_json::json!({"test": "value"}),
@@ -2878,7 +2875,7 @@ mod tests {
 
     #[test]
     fn test_error_response() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         let response = server.error_response(
             Some(serde_json::json!(1)),
             -32600,
@@ -2896,7 +2893,7 @@ mod tests {
 
     #[test]
     fn test_multi_commit_tool_schema() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         let result = server.handle_list_tools().unwrap();
 
         let result_obj = result.as_object().unwrap();
