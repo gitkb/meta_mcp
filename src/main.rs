@@ -965,7 +965,7 @@ impl McpServer {
             .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
 
         // Find and return the raw config
-        let (path, _) = config::find_meta_config_in(meta_dir)
+        let (path, _) = config::find_meta_config_in(meta_dir)?
             .ok_or_else(|| anyhow::anyhow!("No meta config found"))?;
         let content = std::fs::read_to_string(&path)?;
         Ok(format!("Config file: {}\n\n{}", path.display(), content))
