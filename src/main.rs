@@ -965,7 +965,7 @@ impl McpServer {
             .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
 
         // Find and return the raw config
-        let (path, _) = config::find_meta_config_in(meta_dir)
+        let (path, _) = config::find_meta_config_in(meta_dir)?
             .ok_or_else(|| anyhow::anyhow!("No meta config found"))?;
         let content = std::fs::read_to_string(&path)?;
         Ok(format!("Config file: {}\n\n{}", path.display(), content))
@@ -2508,15 +2508,19 @@ mod tests {
     }
 
     #[test]
-    fn test_atomic_batch_refuses_hidden_untracked_files_and_enclosing_repos() {
+    fn test_atomic_batch_refuses_hidden_untracked_files_and_non_repos() {
         let (server, tmp) = workspace();
         let a = tmp.path().join("a");
         git(&a, &["config", "status.showUntrackedFiles", "no"]);
         std::fs::write(a.join("mine"), "my file").unwrap();
-        std::fs::create_dir(a.join("sub")).unwrap();
+        // `c` is a plain directory inside the workspace root's repository,
+        // not a repository of its own. (A project nested inside another
+        // project, such as `a/sub`, is refused when .meta is parsed.)
+        init_repo(tmp.path());
+        std::fs::create_dir(tmp.path().join("c")).unwrap();
         std::fs::write(
             tmp.path().join(".meta"),
-            r#"{"projects":{"a":"x","c":{"repo":"x","path":"a/sub"}}}"#,
+            r#"{"projects":{"a":"x","c":"x"}}"#,
         )
         .unwrap();
 
