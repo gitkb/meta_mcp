@@ -141,7 +141,7 @@ impl McpServer {
     fn new() -> Result<Self> {
         // Find .meta config in current directory or parents
         let cwd = std::env::current_dir()?;
-        let meta_dir = config::find_workspace_root(&cwd)?;
+        let meta_dir = config::nearest_meta_dir(&cwd)?;
         Ok(Self { meta_dir })
     }
 
