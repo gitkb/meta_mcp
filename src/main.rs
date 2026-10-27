@@ -1594,7 +1594,7 @@ impl McpServer {
         repos.extend(
             projects
                 .into_iter()
-                .filter(|p| tag_filter.is_none_or(|tag| p.tags.iter().any(|t| t == tag)))
+                .filter(|p| tag_filter.is_none_or(|tags| has_any_tag(tags, &p.tags)))
                 .map(|p| (p.name, meta_dir.join(p.path))),
         );
         let mut results = Vec::new();
@@ -2257,6 +2257,17 @@ fn string_list(args: &serde_json::Value, key: &str) -> Result<Option<Vec<String>
     }
 }
 
+/// Whether `project_tags` holds any of the comma-separated `tags`, as
+/// `meta --tag` selects.
+fn has_any_tag(tags: &str, project_tags: &[String]) -> bool {
+    tags.split(',')
+        .map(str::trim)
+        .any(|tag| !tag.is_empty() && project_tags.iter().any(|t| t == tag))
+}
+
+/// npm is a `.cmd` script on Windows, which `Command` doesn't find by its bare name.
+const NPM: &str = if cfg!(windows) { "npm.cmd" } else { "npm" };
+
 /// What to run in a repo: build it (`release` for cargo) or test it.
 #[derive(Clone, Copy)]
 enum RepoAction {
@@ -2278,7 +2289,7 @@ fn repo_command(
         })
     } else if path.join("package.json").is_file() {
         Some((
-            "npm",
+            NPM,
             if build {
                 vec!["run", "build"]
             } else {
@@ -2351,6 +2362,14 @@ mod tests {
     }
 
     #[test]
+    fn build_tags_select_like_meta_tag() {
+        let tags = ["red".to_string()];
+        assert!(has_any_tag("red", &tags));
+        assert!(has_any_tag("blue, red", &tags));
+        assert!(!has_any_tag("blue", &tags));
+    }
+
+    #[test]
     fn build_and_test_share_detection_and_keep_release() {
         let tmp = tempfile::tempdir().unwrap();
         for (file, program, build, test) in [
@@ -2361,7 +2380,7 @@ mod tests {
                 vec!["build", "./..."],
                 vec!["test", "./..."],
             ),
-            ("package.json", "npm", vec!["run", "build"], vec!["test"]),
+            ("package.json", NPM, vec!["run", "build"], vec!["test"]),
             (
                 "Cargo.toml",
                 "cargo",
