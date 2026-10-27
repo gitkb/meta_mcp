@@ -1545,7 +1545,7 @@ impl McpServer {
                 continue;
             }
 
-            let Some((cmd_name, cmd_args)) = repo_command(&project_path, "test", false) else {
+            let Some((cmd_name, cmd_args)) = repo_command(&project_path, RepoAction::Test) else {
                 continue;
             };
 
@@ -1600,7 +1600,8 @@ impl McpServer {
         let mut results = Vec::new();
         let mut failed = false;
         for (name, path) in repos {
-            let Some((program, command_args)) = repo_command(&path, "build", release) else {
+            let Some((program, command_args)) = repo_command(&path, RepoAction::Build { release })
+            else {
                 continue;
             };
             match Command::new(program)
@@ -2256,38 +2257,38 @@ fn string_list(args: &serde_json::Value, key: &str) -> Result<Option<Vec<String>
     }
 }
 
+/// What to run in a repo: build it (`release` for cargo) or test it.
+#[derive(Clone, Copy)]
+enum RepoAction {
+    Build { release: bool },
+    Test,
+}
+
 /// Choose build/test commands from the same per-repo build-system precedence.
 fn repo_command(
     path: &std::path::Path,
-    action: &'static str,
-    release: bool,
+    action: RepoAction,
 ) -> Option<(&'static str, Vec<&'static str>)> {
+    let build = matches!(action, RepoAction::Build { .. });
     if path.join("Cargo.toml").is_file() {
-        let mut args = vec![action];
-        if release && action == "build" {
-            args.push("--release");
-        }
-        Some(("cargo", args))
+        Some(match action {
+            RepoAction::Build { release: true } => ("cargo", vec!["build", "--release"]),
+            RepoAction::Build { release: false } => ("cargo", vec!["build"]),
+            RepoAction::Test => ("cargo", vec!["test"]),
+        })
     } else if path.join("package.json").is_file() {
         Some((
             "npm",
-            if action == "build" {
+            if build {
                 vec!["run", "build"]
             } else {
                 vec!["test"]
             },
         ))
     } else if path.join("go.mod").is_file() {
-        Some(("go", vec![action, "./..."]))
+        Some(("go", vec![if build { "build" } else { "test" }, "./..."]))
     } else if path.join("Makefile").is_file() {
-        Some((
-            "make",
-            if action == "build" {
-                vec![]
-            } else {
-                vec!["test"]
-            },
-        ))
+        Some(("make", if build { vec![] } else { vec!["test"] }))
     } else {
         None
     }
@@ -2370,11 +2371,11 @@ mod tests {
         ] {
             std::fs::write(tmp.path().join(file), "").unwrap();
             assert_eq!(
-                repo_command(tmp.path(), "build", true),
+                repo_command(tmp.path(), RepoAction::Build { release: true }),
                 Some((program, build))
             );
             assert_eq!(
-                repo_command(tmp.path(), "test", false),
+                repo_command(tmp.path(), RepoAction::Test),
                 Some((program, test))
             );
         }
