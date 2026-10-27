@@ -2380,7 +2380,12 @@ mod tests {
                 vec!["build", "./..."],
                 vec!["test", "./..."],
             ),
-            ("package.json", NPM, vec!["run", "build"], vec!["test"]),
+            (
+                "package.json",
+                if cfg!(windows) { "npm.cmd" } else { "npm" },
+                vec!["run", "build"],
+                vec!["test"],
+            ),
             (
                 "Cargo.toml",
                 "cargo",
