@@ -2417,7 +2417,11 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let result = server.list_plugins_with(Command::new(meta)).unwrap();
+        // Through sh: running a just-written file can fail with "text file
+        // busy" while another test thread forks
+        let mut sh = Command::new("/bin/sh");
+        sh.arg(&meta);
+        let result = server.list_plugins_with(sh).unwrap();
         assert_eq!(result.trim(), "[]");
     }
 
