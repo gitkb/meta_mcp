@@ -2417,12 +2417,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut cmd = Command::new(meta);
-        cmd.env("HOME", tmp.path())
-            .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
-            .env("GIT_CONFIG_GLOBAL", tmp.path().join("gitconfig"))
-            .env("META_DATA_DIR", tmp.path().join("data"));
-        let result = server.list_plugins_with(cmd).unwrap();
+        let result = server.list_plugins_with(Command::new(meta)).unwrap();
         assert_eq!(result.trim(), "[]");
     }
 
