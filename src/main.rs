@@ -138,14 +138,11 @@ struct McpServer {
 }
 
 impl McpServer {
-    fn new() -> Self {
+    fn new() -> Result<Self> {
         // Find .meta config in current directory or parents
-        let meta_dir = std::env::current_dir()
-            .ok()
-            .and_then(|dir| config::find_meta_config(&dir, None))
-            .and_then(|(config_path, _)| config_path.parent().map(|dir| dir.to_path_buf()));
-
-        Self { meta_dir }
+        let cwd = std::env::current_dir()?;
+        let meta_dir = config::nearest_meta_dir(&cwd)?;
+        Ok(Self { meta_dir })
     }
 
     fn run(&self) -> Result<()> {
@@ -1548,18 +1545,9 @@ impl McpServer {
                 continue;
             }
 
-            let (cmd_name, cmd_args): (&str, Vec<&str>) =
-                if project_path.join("Cargo.toml").exists() {
-                    ("cargo", vec!["test"])
-                } else if project_path.join("package.json").exists() {
-                    ("npm", vec!["test"])
-                } else if project_path.join("go.mod").exists() {
-                    ("go", vec!["test", "./..."])
-                } else if project_path.join("Makefile").exists() {
-                    ("make", vec!["test"])
-                } else {
-                    continue; // No recognized test command
-                };
+            let Some((cmd_name, cmd_args)) = repo_command(&project_path, RepoAction::Test) else {
+                continue;
+            };
 
             let output = Command::new(cmd_name)
                 .args(&cmd_args)
@@ -1599,32 +1587,49 @@ impl McpServer {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let mut cmd = Command::new("meta");
-        cmd.arg("--json");
-
-        if let Some(tag) = args.get("tag").and_then(|v| v.as_str()) {
-            cmd.arg("--tag").arg(tag);
+        let projects = self.load_projects(meta_dir)?;
+        let tag_filter = args.get("tag").and_then(|v| v.as_str());
+        // Root builds remain included even when a tag filter selects child repos.
+        let mut repos = vec![(".".to_string(), meta_dir.clone())];
+        repos.extend(
+            projects
+                .into_iter()
+                .filter(|p| tag_filter.is_none_or(|tags| has_any_tag(tags, &p.tags)))
+                .map(|p| (p.name, meta_dir.join(p.path))),
+        );
+        let mut results = Vec::new();
+        let mut failed = false;
+        for (name, path) in repos {
+            let Some((program, command_args)) = repo_command(&path, RepoAction::Build { release })
+            else {
+                continue;
+            };
+            match Command::new(program)
+                .args(&command_args)
+                .current_dir(&path)
+                .output()
+            {
+                Ok(out) => {
+                    failed |= !out.status.success();
+                    results.push(serde_json::json!({
+                        "project": name,
+                        "command": format!("{} {}", program, command_args.join(" ")).trim_end(),
+                        "success": out.status.success(),
+                        "stdout": String::from_utf8_lossy(&out.stdout),
+                        "stderr": String::from_utf8_lossy(&out.stderr)
+                    }));
+                }
+                Err(e) => {
+                    failed = true;
+                    results.push(serde_json::json!({"project": name, "error": e.to_string()}));
+                }
+            }
         }
-
-        // Use meta exec to run build commands
-        if release {
-            cmd.args(["exec", "--", "cargo", "build", "--release"]);
-        } else {
-            cmd.args(["exec", "--", "cargo", "build"]);
+        let output = serde_json::to_string_pretty(&results)?;
+        if failed {
+            anyhow::bail!("build failed:\n{output}");
         }
-
-        cmd.current_dir(meta_dir);
-
-        let output = cmd.output().context("Failed to execute meta build")?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if output.status.success() {
-            Ok(stdout.to_string())
-        } else {
-            Err(anyhow::anyhow!("build failed:\n{stdout}\n{stderr}"))
-        }
+        Ok(output)
     }
 
     fn tool_clean(&self, args: &serde_json::Value) -> Result<String> {
@@ -1852,13 +1857,16 @@ impl McpServer {
     }
 
     fn tool_list_plugins(&self, _args: &serde_json::Value) -> Result<String> {
+        self.list_plugins_with(Command::new("meta"))
+    }
+
+    fn list_plugins_with(&self, mut cmd: Command) -> Result<String> {
         let meta_dir = self
             .meta_dir
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
 
-        let mut cmd = Command::new("meta");
-        cmd.arg("--json").arg("plugins").arg("list");
+        cmd.args(["plugin", "list", "--json"]);
         cmd.current_dir(meta_dir);
 
         let output = cmd.output().context("Failed to list plugins")?;
@@ -2231,7 +2239,7 @@ impl McpServer {
     // ========================================================================
 
     fn load_projects(&self, meta_dir: &std::path::Path) -> Result<Vec<ProjectInfo>> {
-        let (config_path, _) = config::find_meta_config(meta_dir, None)
+        let (config_path, _) = config::find_meta_config(meta_dir, None)?
             .ok_or_else(|| anyhow::anyhow!("No meta config found"))?;
         let (projects, _ignore) = config::parse_meta_config(&config_path)?;
         Ok(projects)
@@ -2249,8 +2257,56 @@ fn string_list(args: &serde_json::Value, key: &str) -> Result<Option<Vec<String>
     }
 }
 
+/// Whether `project_tags` holds any of the comma-separated `tags`, as
+/// `meta --tag` selects.
+fn has_any_tag(tags: &str, project_tags: &[String]) -> bool {
+    tags.split(',')
+        .map(str::trim)
+        .any(|tag| !tag.is_empty() && project_tags.iter().any(|t| t == tag))
+}
+
+/// npm is a `.cmd` script on Windows, which `Command` doesn't find by its bare name.
+const NPM: &str = if cfg!(windows) { "npm.cmd" } else { "npm" };
+
+/// What to run in a repo: build it (`release` for cargo) or test it.
+#[derive(Clone, Copy)]
+enum RepoAction {
+    Build { release: bool },
+    Test,
+}
+
+/// Choose build/test commands from the same per-repo build-system precedence.
+fn repo_command(
+    path: &std::path::Path,
+    action: RepoAction,
+) -> Option<(&'static str, Vec<&'static str>)> {
+    let build = matches!(action, RepoAction::Build { .. });
+    if path.join("Cargo.toml").is_file() {
+        Some(match action {
+            RepoAction::Build { release: true } => ("cargo", vec!["build", "--release"]),
+            RepoAction::Build { release: false } => ("cargo", vec!["build"]),
+            RepoAction::Test => ("cargo", vec!["test"]),
+        })
+    } else if path.join("package.json").is_file() {
+        Some((
+            NPM,
+            if build {
+                vec!["run", "build"]
+            } else {
+                vec!["test"]
+            },
+        ))
+    } else if path.join("go.mod").is_file() {
+        Some(("go", vec![if build { "build" } else { "test" }, "./..."]))
+    } else if path.join("Makefile").is_file() {
+        Some(("make", if build { vec![] } else { vec!["test"] }))
+    } else {
+        None
+    }
+}
+
 fn main() -> Result<()> {
-    McpServer::new().run()
+    McpServer::new()?.run()
 }
 
 #[cfg(test)]
@@ -2266,6 +2322,107 @@ mod tests {
             meta_dir: Some(tmp.path().to_path_buf()),
         };
         (server, tmp)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn build_uses_make_for_root_and_child_and_reports_failures() {
+        let (server, tmp) = server_with_meta_dir();
+        let child = tmp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(
+            tmp.path().join(".meta"),
+            r#"{"projects":{"child":{"tags":["selected"]}}}"#,
+        )
+        .unwrap();
+        for path in [tmp.path(), child.as_path()] {
+            std::fs::write(path.join("Makefile"), "all:\n\t@echo made > built\n").unwrap();
+        }
+        let output = server
+            .tool_build(&json!({"tag":"selected", "release":true}))
+            .unwrap();
+        let results: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(results.as_array().unwrap().len(), 2);
+        assert!(results
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["command"] == "make" && r["success"] == true));
+        assert!(tmp.path().join("built").exists());
+        assert!(child.join("built").exists());
+        std::fs::write(
+            child.join("Makefile"),
+            "all:\n\t@echo build-failed >&2\n\t@exit 1\n",
+        )
+        .unwrap();
+        let err = server.tool_build(&json!({})).unwrap_err().to_string();
+        assert!(err.contains("build failed:"), "{err}");
+        assert!(err.contains("build-failed"), "{err}");
+        assert!(err.contains("child"), "{err}");
+    }
+
+    #[test]
+    fn build_tags_select_like_meta_tag() {
+        let tags = ["red".to_string()];
+        assert!(has_any_tag("red", &tags));
+        assert!(has_any_tag("blue, red", &tags));
+        assert!(!has_any_tag("blue", &tags));
+    }
+
+    #[test]
+    fn build_and_test_share_detection_and_keep_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (file, program, build, test) in [
+            ("Makefile", "make", vec![], vec!["test"]),
+            (
+                "go.mod",
+                "go",
+                vec!["build", "./..."],
+                vec!["test", "./..."],
+            ),
+            (
+                "package.json",
+                if cfg!(windows) { "npm.cmd" } else { "npm" },
+                vec!["run", "build"],
+                vec!["test"],
+            ),
+            (
+                "Cargo.toml",
+                "cargo",
+                vec!["build", "--release"],
+                vec!["test"],
+            ),
+        ] {
+            std::fs::write(tmp.path().join(file), "").unwrap();
+            assert_eq!(
+                repo_command(tmp.path(), RepoAction::Build { release: true }),
+                Some((program, build))
+            );
+            assert_eq!(
+                repo_command(tmp.path(), RepoAction::Test),
+                Some((program, test))
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_plugins_succeeds_with_supported_cli_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        let (server, tmp) = server_with_meta_dir();
+        let meta = tmp.path().join("meta");
+        std::fs::write(
+            &meta,
+            "#!/bin/sh\n[ \"$*\" = 'plugin list --json' ] || exit 2\nprintf '[]\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Through sh: running a just-written file can fail with "text file
+        // busy" while another test thread forks
+        let mut sh = Command::new("/bin/sh");
+        sh.arg(&meta);
+        let result = server.list_plugins_with(sh).unwrap();
+        assert_eq!(result.trim(), "[]");
     }
 
     #[test]
@@ -2655,7 +2812,7 @@ mod tests {
 
     #[test]
     fn test_server_creation() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         // Server should be created (meta_dir may or may not be set depending on cwd)
         // We just verify it doesn't panic and returns a valid server
         drop(server);
@@ -2663,7 +2820,7 @@ mod tests {
 
     #[test]
     fn test_initialize_response() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         let result = server.handle_initialize().unwrap();
 
         let result_obj = result.as_object().unwrap();
@@ -2674,7 +2831,7 @@ mod tests {
 
     #[test]
     fn test_list_tools_response() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         let result = server.handle_list_tools().unwrap();
 
         let result_obj = result.as_object().unwrap();
@@ -2729,7 +2886,7 @@ mod tests {
 
     #[test]
     fn test_ok_response() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         let response = server.ok_response(
             Some(serde_json::json!(1)),
             serde_json::json!({"test": "value"}),
@@ -2742,7 +2899,7 @@ mod tests {
 
     #[test]
     fn test_error_response() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         let response = server.error_response(
             Some(serde_json::json!(1)),
             -32600,
@@ -2760,7 +2917,7 @@ mod tests {
 
     #[test]
     fn test_multi_commit_tool_schema() {
-        let server = McpServer::new();
+        let server = McpServer::new().unwrap();
         let result = server.handle_list_tools().unwrap();
 
         let result_obj = result.as_object().unwrap();
