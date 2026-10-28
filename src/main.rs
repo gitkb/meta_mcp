@@ -139,7 +139,7 @@ struct McpServer {
 
 impl McpServer {
     fn new() -> Result<Self> {
-        // Find .meta config in current directory or parents
+        // Find .meta.yaml in current directory or parents
         let cwd = std::env::current_dir()?;
         let meta_dir = config::nearest_meta_dir(&cwd)?;
         Ok(Self { meta_dir })
@@ -962,7 +962,7 @@ impl McpServer {
             .ok_or_else(|| anyhow::anyhow!("No meta repository found"))?;
 
         // Find and return the raw config
-        let (path, _) = config::find_meta_config_in(meta_dir)?
+        let path = config::find_meta_config_in(meta_dir)?
             .ok_or_else(|| anyhow::anyhow!("No meta config found"))?;
         let content = std::fs::read_to_string(&path)?;
         Ok(format!("Config file: {}\n\n{}", path.display(), content))
@@ -2239,7 +2239,7 @@ impl McpServer {
     // ========================================================================
 
     fn load_projects(&self, meta_dir: &std::path::Path) -> Result<Vec<ProjectInfo>> {
-        let (config_path, _) = config::find_meta_config(meta_dir, None)?
+        let config_path = config::find_meta_config(meta_dir, None)?
             .ok_or_else(|| anyhow::anyhow!("No meta config found"))?;
         let (projects, _ignore) = config::parse_meta_config(&config_path)?;
         Ok(projects)
@@ -2317,7 +2317,7 @@ mod tests {
     /// Create a server with a known meta_dir for tests that need one.
     fn server_with_meta_dir() -> (McpServer, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(".meta"), "{}").unwrap();
+        std::fs::write(tmp.path().join(".meta.yaml"), "{}").unwrap();
         let server = McpServer {
             meta_dir: Some(tmp.path().to_path_buf()),
         };
@@ -2331,7 +2331,7 @@ mod tests {
         let child = tmp.path().join("child");
         std::fs::create_dir(&child).unwrap();
         std::fs::write(
-            tmp.path().join(".meta"),
+            tmp.path().join(".meta.yaml"),
             r#"{"projects":{"child":{"tags":["selected"]}}}"#,
         )
         .unwrap();
@@ -2560,7 +2560,7 @@ mod tests {
     fn workspace() -> (McpServer, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
-            tmp.path().join(".meta"),
+            tmp.path().join(".meta.yaml"),
             r#"{"projects":{"a":{"repo":"x","tags":["x"]},"b":"x"}}"#,
         )
         .unwrap();
@@ -2672,11 +2672,11 @@ mod tests {
         std::fs::write(a.join("mine"), "my file").unwrap();
         // `c` is a plain directory inside the workspace root's repository,
         // not a repository of its own. (A project nested inside another
-        // project, such as `a/sub`, is refused when .meta is parsed.)
+        // project, such as `a/sub`, is refused when .meta.yaml is parsed.)
         init_repo(tmp.path());
         std::fs::create_dir(tmp.path().join("c")).unwrap();
         std::fs::write(
-            tmp.path().join(".meta"),
+            tmp.path().join(".meta.yaml"),
             r#"{"projects":{"a":"x","c":"x"}}"#,
         )
         .unwrap();
@@ -2724,7 +2724,7 @@ mod tests {
         let (server, tmp) = workspace();
         init_repo(&tmp.path().join("c"));
         std::fs::write(
-            tmp.path().join(".meta"),
+            tmp.path().join(".meta.yaml"),
             r#"{"projects":{"a":"x","b":"x","c":"x"}}"#,
         )
         .unwrap();
@@ -2747,7 +2747,7 @@ mod tests {
     fn test_rollback_reports_the_branch_tip_and_recreates_a_deleted_branch() {
         let (server, tmp) = workspace();
         let a = tmp.path().join("a");
-        std::fs::write(tmp.path().join(".meta"), r#"{"projects":{"a":"x"}}"#).unwrap();
+        std::fs::write(tmp.path().join(".meta.yaml"), r#"{"projects":{"a":"x"}}"#).unwrap();
         let head = git(&a, &["rev-parse", "HEAD"]);
         let commit =
             "echo x > README && git -c user.name=t -c user.email=t@example.com commit -qam x";
@@ -2795,7 +2795,7 @@ mod tests {
         );
         git(&a, &["commit", "-qm", "sub"]);
         git(&a, &["config", "submodule.recurse", "true"]);
-        std::fs::write(tmp.path().join(".meta"), r#"{"projects":{"a":"x"}}"#).unwrap();
+        std::fs::write(tmp.path().join(".meta.yaml"), r#"{"projects":{"a":"x"}}"#).unwrap();
 
         // The command moves the submodule on and commits that in `a`.
         let id = "git -c user.name=t -c user.email=t@example.com";
